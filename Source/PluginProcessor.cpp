@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include <juce_audio_processors/format/juce_AudioPluginFormatManagerHelpers.h>
 
 using IOProcessor = juce::AudioProcessorGraph::AudioGraphIOProcessor;
 
@@ -40,7 +41,7 @@ UltrapatcherProcessor::UltrapatcherProcessor()
                           .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
                           .withOutput ("Output", juce::AudioChannelSet::stereo(), true))
 {
-    formatManager.addDefaultFormats();
+    juce::addDefaultFormatsToManager (formatManager);
 
     getSupportDirectory().createDirectory();
     if (auto xml = juce::parseXML (getSupportDirectory().getChildFile ("plugins.xml")))

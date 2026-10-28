@@ -27,7 +27,8 @@ target_compile_definitions(Ultrapatcher PUBLIC
     JUCE_USE_CURL=0
     JUCE_VST3_CAN_REPLACE_VST2=0
     JUCE_PLUGINHOST_VST3=1
-    JUCE_STRICT_REFCOUNTEDPOINTER=1)
+    JUCE_STRICT_REFCOUNTEDPOINTER=1
+    JUCE_USE_XINPUT=0)
 
 target_link_libraries(Ultrapatcher
     PRIVATE

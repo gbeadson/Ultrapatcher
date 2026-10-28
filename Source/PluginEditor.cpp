@@ -142,7 +142,7 @@ void UltrapatcherEditor::openHostedEditor()
     if (plugin == nullptr || ! plugin->hasEditor())
         return;
 
-    auto* hostedEditor = plugin->createEditorIfNeeded();
+    auto* hostedEditor = plugin->createEditorAndMakeActive();
     if (hostedEditor == nullptr)
         return;
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <juce_audio_utils/juce_audio_utils.h>
+#include "Settings.h"
 
 // Milestone 2: hosts one third-party plugin and exposes a fixed pool of generic
 // DAW parameters ("Param 1".."Param 128") that can be mapped to the hosted
@@ -78,9 +79,21 @@ public:
     int getSlotMapping (int slot) const;      // hosted parameter index, or -1
     juce::String getSlotName (int slot) const; // hosted parameter name, or empty
 
-    // Plugin scanning (background thread).
-    void startScan();
+    // Plugin scanning (background thread). The normal scan covers each format's
+    // default locations plus the custom folders; customFoldersOnly skips the defaults.
+    void startScan (bool customFoldersOnly = false);
     bool isScanning() const { return scanning.load(); }
+
+    // Load a plugin by file path (for example a .vst3 picked or dropped by the
+    // user). Any thread. Also adds it to the known-plugin list.
+    void loadPluginFromFile (const juce::File&);
+
+    // Settings (message thread). Changes are saved immediately.
+    juce::StringArray getScanFolders() const { return settings.scanFolders; }
+    void addScanFolder (const juce::File&);
+    void removeScanFolder (int index);
+    bool isWindowAlwaysOnTop() const { return settings.windowAlwaysOnTop; }
+    void setWindowAlwaysOnTop (bool);
 
     juce::AudioPluginFormatManager formatManager;
     juce::KnownPluginList knownPlugins;
@@ -105,9 +118,14 @@ private:
     void detachHostedNode();
     void rebuildConnections();
     void scanFinished();
+    void doLoadFromFile (const juce::File&);
+    void savePluginList();
+    void saveSettings();
     void timerCallback() override;
     void applyPoolToHosted();
     juce::File getSupportDirectory() const;
+
+    UltrapatcherSettings settings;
 
     juce::AudioProcessorGraph graph;
     Node::Ptr audioInNode, audioOutNode, midiInNode, midiOutNode, hostedNode;

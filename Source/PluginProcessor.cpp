@@ -9,7 +9,9 @@ using IOProcessor = juce::AudioProcessorGraph::AudioGraphIOProcessor;
 class UltrapatcherProcessor::ScanThread : public juce::Thread
 {
 public:
-    explicit ScanThread (UltrapatcherProcessor& o) : juce::Thread ("Ultrapatcher plugin scan"), owner (o) {}
+    ScanThread (UltrapatcherProcessor& o, bool customOnly, juce::StringArray extraFolders)
+        : juce::Thread ("Ultrapatcher plugin scan"), owner (o),
+          customFoldersOnly (customOnly), folders (std::move (extraFolders)) {}
     ~ScanThread() override { stopThread (15000); }
 
     void run() override
@@ -20,8 +22,15 @@ public:
         {
             auto* format = owner.formatManager.getFormat (i);
 
-            juce::PluginDirectoryScanner scanner (owner.knownPlugins, *format,
-                                                  format->getDefaultLocationsToSearch(),
+            juce::FileSearchPath searchPath;
+
+            if (! customFoldersOnly)
+                searchPath = format->getDefaultLocationsToSearch();
+
+            for (const auto& folder : folders)
+                searchPath.add (juce::File (folder));
+
+            juce::PluginDirectoryScanner scanner (owner.knownPlugins, *format, searchPath,
                                                   true, deadMans, false);
             juce::String name;
             while (! threadShouldExit() && scanner.scanNextFile (true, name)) {}
@@ -33,6 +42,8 @@ public:
 
 private:
     UltrapatcherProcessor& owner;
+    const bool customFoldersOnly;
+    const juce::StringArray folders;
 };
 
 //==============================================================================
@@ -97,6 +108,7 @@ UltrapatcherProcessor::UltrapatcherProcessor()
     juce::addDefaultFormatsToManager (formatManager);
 
     getSupportDirectory().createDirectory();
+    settings.load (getSupportDirectory().getChildFile ("settings.xml"));
     if (auto xml = juce::parseXML (getSupportDirectory().getChildFile ("plugins.xml")))
         knownPlugins.recreateFromXml (*xml);
 
@@ -497,23 +509,114 @@ void UltrapatcherProcessor::timerCallback()
 }
 
 //==============================================================================
-void UltrapatcherProcessor::startScan()
+void UltrapatcherProcessor::startScan (bool customFoldersOnly)
 {
-    if (scanning.exchange (true))
+    if (scanning.load())
         return;
 
-    scanThread = std::make_unique<ScanThread> (*this);
+    if (customFoldersOnly && settings.scanFolders.isEmpty())
+    {
+        lastError = "Add a scan folder in Settings first";
+        sendChangeMessage();
+        return;
+    }
+
+    lastError.clear();
+    scanning = true;
+
+    scanThread = std::make_unique<ScanThread> (*this, customFoldersOnly, settings.scanFolders);
     scanThread->startThread();
     sendChangeMessage();
 }
 
 void UltrapatcherProcessor::scanFinished()
 {
-    if (auto xml = knownPlugins.createXml())
-        xml->writeTo (getSupportDirectory().getChildFile ("plugins.xml"));
-
+    savePluginList();
     scanning = false;
     sendChangeMessage();
+}
+
+void UltrapatcherProcessor::savePluginList()
+{
+    if (auto xml = knownPlugins.createXml())
+        xml->writeTo (getSupportDirectory().getChildFile ("plugins.xml"));
+}
+
+void UltrapatcherProcessor::saveSettings()
+{
+    settings.save (getSupportDirectory().getChildFile ("settings.xml"));
+}
+
+void UltrapatcherProcessor::addScanFolder (const juce::File& folder)
+{
+    if (! folder.isDirectory())
+        return;
+
+    settings.scanFolders.addIfNotAlreadyThere (folder.getFullPathName());
+    saveSettings();
+    sendChangeMessage();
+}
+
+void UltrapatcherProcessor::removeScanFolder (int index)
+{
+    if (! juce::isPositiveAndBelow (index, settings.scanFolders.size()))
+        return;
+
+    settings.scanFolders.remove (index);
+    saveSettings();
+    sendChangeMessage();
+}
+
+void UltrapatcherProcessor::setWindowAlwaysOnTop (bool shouldBeOnTop)
+{
+    if (settings.windowAlwaysOnTop == shouldBeOnTop)
+        return;
+
+    settings.windowAlwaysOnTop = shouldBeOnTop;
+    saveSettings();
+    sendChangeMessage();
+}
+
+// Loads a plugin from a file path. The file is probed through the same JUCE
+// scanner the folder scan uses, so it also lands in the known-plugin list.
+void UltrapatcherProcessor::loadPluginFromFile (const juce::File& file)
+{
+    juce::WeakReference<UltrapatcherProcessor> weak (this);
+
+    juce::MessageManager::callAsync ([weak, file]
+    {
+        if (weak != nullptr)
+            weak->doLoadFromFile (file);
+    });
+}
+
+void UltrapatcherProcessor::doLoadFromFile (const juce::File& file)
+{
+    lastError.clear();
+
+    const auto path = file.getFullPathName();
+    juce::OwnedArray<juce::PluginDescription> found;
+
+    if (file.exists())
+    {
+        for (int i = 0; i < formatManager.getNumFormats() && found.isEmpty(); ++i)
+        {
+            auto* format = formatManager.getFormat (i);
+
+            if (format->fileMightContainThisPluginType (path))
+                knownPlugins.scanAndAddFile (path, true, found, *format);
+        }
+    }
+
+    if (found.isEmpty())
+    {
+        lastError = "Could not load " + file.getFileName() + " as a plugin";
+        sendChangeMessage();
+        return;
+    }
+
+    savePluginList();
+    loadPlugin (*found.getFirst());
 }
 
 //==============================================================================

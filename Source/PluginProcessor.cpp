@@ -36,6 +36,59 @@ private:
 };
 
 //==============================================================================
+// A generic automatable parameter whose display name follows the hosted
+// parameter it is mapped to ("Param 3" becomes "Cutoff").
+class UltrapatcherProcessor::PoolParameter : public juce::AudioParameterFloat
+{
+public:
+    explicit PoolParameter (int slotIndex)
+        : juce::AudioParameterFloat (juce::ParameterID ("pool" + juce::String (slotIndex + 1).paddedLeft ('0', 3), 1),
+                                     "Param " + juce::String (slotIndex + 1),
+                                     juce::NormalisableRange<float> (0.0f, 1.0f),
+                                     0.0f),
+          defaultName ("Param " + juce::String (slotIndex + 1))
+    {
+    }
+
+    juce::String getName (int maximumStringLength) const override
+    {
+        const juce::ScopedLock sl (nameLock);
+        return (mappedName.isEmpty() ? defaultName : mappedName).substring (0, maximumStringLength);
+    }
+
+    void setMappedName (const juce::String& newName)
+    {
+        const juce::ScopedLock sl (nameLock);
+        mappedName = newName;
+    }
+
+    juce::String getMappedName() const
+    {
+        const juce::ScopedLock sl (nameLock);
+        return mappedName;
+    }
+
+private:
+    mutable juce::CriticalSection nameLock;
+    juce::String defaultName, mappedName;
+};
+
+static int resolveHostedIndex (const juce::Array<juce::AudioProcessorParameter*>& params,
+                               const juce::String& name, int index)
+{
+    if (juce::isPositiveAndBelow (index, params.size()) && params[index]->getName (64) == name)
+        return index;
+
+    for (int i = 0; i < params.size(); ++i)
+        if (params[i]->getName (64) == name)
+            return i;
+
+    return -1;
+}
+
+constexpr float kParamEpsilon = 1.0e-6f;
+
+//==============================================================================
 UltrapatcherProcessor::UltrapatcherProcessor()
     : AudioProcessor (BusesProperties()
                           .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
@@ -57,10 +110,19 @@ UltrapatcherProcessor::UltrapatcherProcessor()
     midiOutNode  = graph.addNode (std::make_unique<IOProcessor> (IOProcessor::midiOutputNode));
 
     rebuildConnections();
+
+    for (int i = 0; i < kPoolSize; ++i)
+    {
+        pool[(size_t) i] = new PoolParameter (i);
+        addParameter (pool[(size_t) i]); // the AudioProcessor owns it
+    }
+
+    startTimerHz (30);
 }
 
 UltrapatcherProcessor::~UltrapatcherProcessor()
 {
+    stopTimer();
     scanThread.reset();
     masterReference.clear();
 }
@@ -96,6 +158,7 @@ bool UltrapatcherProcessor::isBusesLayoutSupported (const BusesLayout& layouts) 
 void UltrapatcherProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi)
 {
     juce::ScopedNoDenormals noDenormals;
+    applyPoolToHosted();
     graph.processBlock (buffer, midi);
 }
 
@@ -145,18 +208,22 @@ juce::AudioPluginInstance* UltrapatcherProcessor::getHostedPlugin() const
     return dynamic_cast<juce::AudioPluginInstance*> (hostedNode->getProcessor());
 }
 
-void UltrapatcherProcessor::loadPlugin (const juce::PluginDescription& desc, const juce::MemoryBlock& state)
+void UltrapatcherProcessor::loadPlugin (const juce::PluginDescription& desc,
+                                        const juce::MemoryBlock& state,
+                                        const std::vector<SlotMap>& maps)
 {
     juce::WeakReference<UltrapatcherProcessor> weak (this);
 
-    juce::MessageManager::callAsync ([weak, desc, state]
+    juce::MessageManager::callAsync ([weak, desc, state, maps]
     {
         if (weak != nullptr)
-            weak->doLoad (desc, state);
+            weak->doLoad (desc, state, maps);
     });
 }
 
-void UltrapatcherProcessor::doLoad (const juce::PluginDescription& desc, const juce::MemoryBlock& state)
+void UltrapatcherProcessor::doLoad (const juce::PluginDescription& desc,
+                                    const juce::MemoryBlock& state,
+                                    const std::vector<SlotMap>& maps)
 {
     lastError.clear();
 
@@ -166,7 +233,7 @@ void UltrapatcherProcessor::doLoad (const juce::PluginDescription& desc, const j
     juce::WeakReference<UltrapatcherProcessor> weak (this);
 
     formatManager.createPluginInstanceAsync (desc, sr, bs,
-        [weak, desc, state] (std::unique_ptr<juce::AudioPluginInstance> instance, const juce::String& error)
+        [weak, desc, state, maps] (std::unique_ptr<juce::AudioPluginInstance> instance, const juce::String& error)
         {
             if (weak == nullptr)
                 return;
@@ -185,14 +252,31 @@ void UltrapatcherProcessor::doLoad (const juce::PluginDescription& desc, const j
             weak->hostedChanging = true;
             weak->sendSynchronousChangeMessage();
 
-            if (weak->hostedNode != nullptr)
-                weak->graph.removeNode (weak->hostedNode->nodeID);
+            weak->detachHostedNode();
+
+            auto node = weak->graph.addNode (std::move (instance));
+
+            {
+                const juce::SpinLock::ScopedLockType sl (weak->mappingLock);
+                weak->hostedNode = node;
+            }
 
             weak->hostedDescription = desc;
-            weak->hostedNode = weak->graph.addNode (std::move (instance));
+            ++weak->hostedGeneration;
             weak->rebuildConnections();
-            weak->setLatencySamples (weak->hostedNode->getProcessor()->getLatencySamples());
+            weak->setLatencySamples (node->getProcessor()->getLatencySamples());
             weak->updateHostDisplay (ChangeDetails().withLatencyChanged (true));
+
+            // Restore saved mappings, matching by parameter name first.
+            const auto& params = node->getProcessor()->getParameters();
+
+            for (const auto& m : maps)
+            {
+                const int idx = resolveHostedIndex (params, m.hostedName, m.hostedIndex);
+
+                if (idx >= 0)
+                    weak->mapSlot (m.slot, idx);
+            }
 
             weak->hostedChanging = false;
             weak->sendChangeMessage();
@@ -218,15 +302,198 @@ void UltrapatcherProcessor::doUnload()
     hostedChanging = true;
     sendSynchronousChangeMessage();
 
-    graph.removeNode (hostedNode->nodeID);
-    hostedNode = nullptr;
-    hostedDescription = {};
+    detachHostedNode();
     rebuildConnections();
     setLatencySamples (0);
-    updateHostDisplay (ChangeDetails().withLatencyChanged (true));
+    updateHostDisplay (ChangeDetails().withLatencyChanged (true).withParameterInfoChanged (true));
 
     hostedChanging = false;
     sendChangeMessage();
+}
+
+// Message thread. Takes the hosted node out of the audio thread's reach
+// (under the lock) before it is removed from the graph and destroyed.
+void UltrapatcherProcessor::detachHostedNode()
+{
+    Node::Ptr old;
+
+    {
+        const juce::SpinLock::ScopedLockType sl (mappingLock);
+        old = std::move (hostedNode);
+        hostedNode = nullptr;
+
+        for (auto& s : slots)
+            s = {};
+    }
+
+    for (auto* p : pool)
+        p->setMappedName ({});
+
+    if (old != nullptr)
+        graph.removeNode (old->nodeID);
+
+    hostedDescription = {};
+    ++hostedGeneration;
+}
+
+//==============================================================================
+// Parameter pool.
+//
+// Pool slot values are the source of truth for the DAW and the Surface.
+//  - Audio thread (applyPoolToHosted): a changed pool value is pushed to the
+//    hosted parameter at block rate.
+//  - Message thread (timerCallback): a changed hosted value, for example from
+//    turning a knob in the plugin's own GUI, is pushed back into the pool so
+//    the DAW records it and the Surface follows.
+// lastPoolApplied / lastHostedSeen stop the two directions from echoing.
+juce::RangedAudioParameter* UltrapatcherProcessor::getPoolParameter (int slot) const
+{
+    return juce::isPositiveAndBelow (slot, kPoolSize) ? pool[(size_t) slot] : nullptr;
+}
+
+juce::Array<UltrapatcherProcessor::HostedParamInfo> UltrapatcherProcessor::getHostedParameterList() const
+{
+    juce::Array<HostedParamInfo> list;
+
+    if (hostedNode == nullptr)
+        return list;
+
+    const auto& params = hostedNode->getProcessor()->getParameters();
+
+    for (int i = 0; i < params.size(); ++i)
+        if (params[i]->isAutomatable())
+            list.add ({ i, params[i]->getName (64) });
+
+    return list;
+}
+
+bool UltrapatcherProcessor::mapSlot (int slot, int hostedParamIndex)
+{
+    if (! juce::isPositiveAndBelow (slot, kPoolSize) || hostedNode == nullptr)
+        return false;
+
+    const auto& params = hostedNode->getProcessor()->getParameters();
+
+    if (! juce::isPositiveAndBelow (hostedParamIndex, params.size()))
+        return false;
+
+    auto* hostedParam = params[hostedParamIndex];
+    const float hostedValue = hostedParam->getValue();
+
+    // Move the pool value to the hosted value before the mapping goes live,
+    // so mapping never makes the hosted parameter jump.
+    pool[(size_t) slot]->setMappedName (hostedParam->getName (64));
+    pool[(size_t) slot]->setValueNotifyingHost (hostedValue);
+
+    {
+        const juce::SpinLock::ScopedLockType sl (mappingLock);
+        slots[(size_t) slot] = { hostedParamIndex, pool[(size_t) slot]->get(), hostedValue };
+    }
+
+    updateHostDisplay (ChangeDetails().withParameterInfoChanged (true));
+    sendChangeMessage();
+    return true;
+}
+
+void UltrapatcherProcessor::unmapSlot (int slot)
+{
+    if (! juce::isPositiveAndBelow (slot, kPoolSize))
+        return;
+
+    {
+        const juce::SpinLock::ScopedLockType sl (mappingLock);
+        slots[(size_t) slot] = {};
+    }
+
+    pool[(size_t) slot]->setMappedName ({});
+    updateHostDisplay (ChangeDetails().withParameterInfoChanged (true));
+    sendChangeMessage();
+}
+
+int UltrapatcherProcessor::getSlotMapping (int slot) const
+{
+    return juce::isPositiveAndBelow (slot, kPoolSize) ? slots[(size_t) slot].hostedIndex : -1;
+}
+
+juce::String UltrapatcherProcessor::getSlotName (int slot) const
+{
+    return juce::isPositiveAndBelow (slot, kPoolSize) ? pool[(size_t) slot]->getMappedName() : juce::String();
+}
+
+// Audio thread. Never blocks: if the message thread holds the lock this
+// block simply skips the update and the next block catches up.
+void UltrapatcherProcessor::applyPoolToHosted()
+{
+    const juce::SpinLock::ScopedTryLockType lock (mappingLock);
+
+    if (! lock.isLocked() || hostedNode == nullptr)
+        return;
+
+    const auto& params = hostedNode->getProcessor()->getParameters();
+
+    for (size_t i = 0; i < (size_t) kPoolSize; ++i)
+    {
+        auto& s = slots[i];
+
+        if (s.hostedIndex < 0 || s.hostedIndex >= params.size())
+            continue;
+
+        const float poolValue = pool[i]->get();
+
+        if (std::abs (poolValue - s.lastPoolApplied) > kParamEpsilon)
+        {
+            s.lastPoolApplied = poolValue;
+
+            auto* hostedParam = params[s.hostedIndex];
+            hostedParam->setValue (poolValue);
+            s.lastHostedSeen = hostedParam->getValue(); // read back: stepped params may snap
+        }
+    }
+}
+
+// Message thread, 30 Hz. Hosted -> pool direction.
+void UltrapatcherProcessor::timerCallback()
+{
+    std::vector<std::pair<int, float>> updates;
+
+    {
+        const juce::SpinLock::ScopedLockType sl (mappingLock);
+
+        if (hostedNode == nullptr)
+            return;
+
+        const auto& params = hostedNode->getProcessor()->getParameters();
+
+        for (size_t i = 0; i < (size_t) kPoolSize; ++i)
+        {
+            auto& s = slots[i];
+
+            if (s.hostedIndex < 0 || s.hostedIndex >= params.size())
+                continue;
+
+            const float hostedValue = params[s.hostedIndex]->getValue();
+
+            if (std::abs (hostedValue - s.lastHostedSeen) > kParamEpsilon)
+            {
+                s.lastHostedSeen = hostedValue;
+
+                if (std::abs (hostedValue - pool[i]->get()) > kParamEpsilon)
+                {
+                    s.lastPoolApplied = hostedValue; // the pool is about to take this value
+                    updates.emplace_back ((int) i, hostedValue);
+                }
+            }
+        }
+    }
+
+    // Call into the host outside the lock.
+    for (const auto& u : updates)
+    {
+        auto* p = pool[(size_t) u.first];
+        p->beginChangeGesture();
+        p->setValueNotifyingHost (u.second);
+        p->endChangeGesture();
+    }
 }
 
 //==============================================================================
@@ -250,20 +517,42 @@ void UltrapatcherProcessor::scanFinished()
 }
 
 //==============================================================================
-// State: the hosted plugin's description plus its opaque state blob.
-// Format is versioned from day one.
+// State: the hosted plugin's description and opaque state blob, plus the
+// pool-slot mappings. Version 2 added <MAPS>; version 1 projects still load.
 void UltrapatcherProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     juce::XmlElement xml ("Ultrapatcher");
-    xml.setAttribute ("version", 1);
+    xml.setAttribute ("version", 2);
 
-    if (auto* plugin = getHostedPlugin())
+    Node::Ptr node;
+    std::vector<int> mappedSlots;
+
+    {
+        const juce::SpinLock::ScopedLockType sl (mappingLock);
+        node = hostedNode;
+
+        for (int i = 0; i < kPoolSize; ++i)
+            if (slots[(size_t) i].hostedIndex >= 0)
+                mappedSlots.push_back (i);
+    }
+
+    if (node != nullptr)
     {
         xml.addChildElement (hostedDescription.createXml().release());
 
         juce::MemoryBlock pluginState;
-        plugin->getStateInformation (pluginState);
+        node->getProcessor()->getStateInformation (pluginState);
         xml.setAttribute ("pluginState", pluginState.toBase64Encoding());
+
+        auto* mapsXml = xml.createNewChildElement ("MAPS");
+
+        for (int slot : mappedSlots)
+        {
+            auto* m = mapsXml->createNewChildElement ("MAP");
+            m->setAttribute ("slot", slot);
+            m->setAttribute ("index", slots[(size_t) slot].hostedIndex);
+            m->setAttribute ("name", pool[(size_t) slot]->getMappedName());
+        }
     }
 
     copyXmlToBinary (xml, destData);
@@ -284,7 +573,16 @@ void UltrapatcherProcessor::setStateInformation (const void* data, int sizeInByt
         {
             juce::MemoryBlock pluginState;
             pluginState.fromBase64Encoding (xml->getStringAttribute ("pluginState"));
-            loadPlugin (desc, pluginState);
+
+            std::vector<SlotMap> maps;
+
+            if (auto* mapsXml = xml->getChildByName ("MAPS"))
+                for (auto* m : mapsXml->getChildWithTagNameIterator ("MAP"))
+                    maps.push_back ({ m->getIntAttribute ("slot", -1),
+                                      m->getIntAttribute ("index", -1),
+                                      m->getStringAttribute ("name") });
+
+            loadPlugin (desc, pluginState, maps);
         }
     }
 }

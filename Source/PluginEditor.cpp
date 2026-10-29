@@ -32,8 +32,32 @@ UltrapatcherEditor::UltrapatcherEditor (UltrapatcherProcessor& p)
     : juce::AudioProcessorEditor (&p), proc (p)
 {
     for (auto* c : std::initializer_list<juce::Component*> { &scanButton, &loadButton, &unloadButton,
-                                                              &openButton, &pluginBox, &statusLabel })
+                                                              &openButton, &pluginBox, &statusLabel,
+                                                              &surfaceTitle, &surfaceKnob, &knobLabel, &mapBox })
         addAndMakeVisible (c);
+
+    surfaceTitle.setText ("Surface", juce::dontSendNotification);
+    surfaceTitle.setFont (juce::FontOptions (15.0f, juce::Font::bold));
+
+    surfaceKnob.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+    surfaceKnob.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 70, 18);
+    surfaceKnob.setNumDecimalPlacesToDisplay (2);
+
+    // The knob binds to a pool slot, never to the hosted parameter directly.
+    knobAttachment = std::make_unique<juce::SliderParameterAttachment> (*proc.getPoolParameter (kSurfaceSlot),
+                                                                         surfaceKnob, nullptr);
+
+    knobLabel.setJustificationType (juce::Justification::centredLeft);
+
+    mapBox.onChange = [this]
+    {
+        const int id = mapBox.getSelectedId();
+
+        if (id == 1)
+            proc.unmapSlot (kSurfaceSlot);
+        else if (id > 1)
+            proc.mapSlot (kSurfaceSlot, id - 2);
+    };
 
     statusLabel.setJustificationType (juce::Justification::centredLeft);
 
@@ -53,7 +77,7 @@ UltrapatcherEditor::UltrapatcherEditor (UltrapatcherProcessor& p)
     proc.knownPlugins.addChangeListener (this);
 
     refresh();
-    setSize (480, 170);
+    setSize (480, 280);
 }
 
 UltrapatcherEditor::~UltrapatcherEditor()
@@ -87,6 +111,18 @@ void UltrapatcherEditor::resized()
     unloadButton.setBounds (row.removeFromLeft (80));
     row.removeFromLeft (8);
     openButton.setBounds   (row.removeFromLeft (170));
+
+    area.removeFromTop (16);
+    surfaceTitle.setBounds (area.removeFromTop (22));
+
+    area.removeFromTop (4);
+    auto surfaceRow = area.removeFromTop (110);
+    surfaceKnob.setBounds (surfaceRow.removeFromLeft (100));
+    surfaceRow.removeFromLeft (12);
+    surfaceRow.removeFromTop (14);
+    knobLabel.setBounds (surfaceRow.removeFromTop (24));
+    surfaceRow.removeFromTop (6);
+    mapBox.setBounds (surfaceRow.removeFromTop (28));
 }
 
 void UltrapatcherEditor::changeListenerCallback (juce::ChangeBroadcaster* source)
@@ -116,6 +152,13 @@ void UltrapatcherEditor::refresh()
 
     const bool hosting = proc.getHostedPlugin() != nullptr;
 
+    refreshMapBox();
+    mapBox.setEnabled (hosting);
+    surfaceKnob.setEnabled (true);
+
+    const auto mappedName = proc.getSlotName (kSurfaceSlot);
+    knobLabel.setText (mappedName.isNotEmpty() ? mappedName : "Not mapped", juce::dontSendNotification);
+
     scanButton.setEnabled (! proc.isScanning());
     unloadButton.setEnabled (hosting);
     openButton.setEnabled (hosting);
@@ -128,6 +171,26 @@ void UltrapatcherEditor::refresh()
         statusLabel.setText ("Hosting: " + proc.getHostedName(), juce::dontSendNotification);
     else
         statusLabel.setText ("No plugin loaded (passthrough)", juce::dontSendNotification);
+}
+
+// Rebuilds the parameter list only when the hosted plugin changes: some plugins
+// expose thousands of parameters and refresh() runs on every state change.
+void UltrapatcherEditor::refreshMapBox()
+{
+    const int generation = proc.getHostedGeneration();
+
+    if (generation != mapBoxGeneration)
+    {
+        mapBoxGeneration = generation;
+        mapBox.clear (juce::dontSendNotification);
+        mapBox.addItem ("(not mapped)", 1);
+
+        for (const auto& info : proc.getHostedParameterList())
+            mapBox.addItem (info.name, info.index + 2);
+    }
+
+    const int mapped = proc.getSlotMapping (kSurfaceSlot);
+    mapBox.setSelectedId (mapped >= 0 ? mapped + 2 : 1, juce::dontSendNotification);
 }
 
 void UltrapatcherEditor::openHostedEditor()

@@ -1,5 +1,6 @@
 #include "PluginEditor.h"
 #include "PluginSearch.h"
+#include "PoolParameter.h"
 
 static juce::Font makeFont (float height, int styleFlags = juce::Font::plain)
 {
@@ -201,23 +202,32 @@ static bool isVst3Path (const juce::String& path)
 }
 
 UltrapatcherEditor::UltrapatcherEditor (UltrapatcherProcessor& p)
-    : juce::AudioProcessorEditor (&p), proc (p)
+    : juce::AudioProcessorEditor (&p), proc (p), canvas (p), surface (p)
 {
-    for (auto* c : std::initializer_list<juce::Component*> { &scanButton, &loadButton, &unloadButton,
-                                                              &openButton, &pinButton, &settingsButton,
-                                                              &searchBox, &listBox, &statusLabel,
-                                                              &surfaceTitle, &surfaceKnob, &knobLabel, &mapBox })
+    for (auto* c : std::initializer_list<juce::Component*> { &scanButton, &addButton, &removeButton, &openButton,
+                                                              &bypassButton, &pinButton, &settingsButton,
+                                                              &searchBox, &listBox, &statusLabel, &canvas, &surface })
         addAndMakeVisible (c);
 
     // Toolbar
+    bypassButton.setClickingTogglesState (false);
     pinButton.setClickingTogglesState (true);
 
     scanButton.onClick     = [this] { proc.startScan(); };
-    loadButton.onClick     = [this] { loadSelected(); };
-    unloadButton.onClick   = [this] { proc.unloadPlugin(); };
-    openButton.onClick     = [this] { openHostedEditor(); };
+    addButton.onClick      = [this] { addSelectedPlugin(); };
+    removeButton.onClick   = [this] { removeSelectedNode(); };
+    openButton.onClick     = [this] { openNodeWindow (canvas.getSelectedNode()); };
     pinButton.onClick      = [this] { proc.setWindowAlwaysOnTop (pinButton.getToggleState()); };
     settingsButton.onClick = [this] { openSettings(); };
+
+    bypassButton.onClick = [this]
+    {
+        const auto uid = canvas.getSelectedNode();
+
+        for (const auto& info : proc.getPatchNodes())
+            if (info.uid == uid && ! info.isIO)
+                proc.setNodeBypassed (uid, ! info.bypassed);
+    };
 
     // Search and list
     searchBox.setTextToShowWhenEmpty ("Search plugins...", juce::Colours::grey);
@@ -225,47 +235,30 @@ UltrapatcherEditor::UltrapatcherEditor (UltrapatcherProcessor& p)
     searchBox.onTextChange = [this] { applyFilter(); };
     searchBox.onEscapeKey  = [this] { searchBox.clear(); };
 
-    listBox.setRowHeight (26);
+    listBox.setRowHeight (36);
     listBox.setOutlineThickness (1);
 
     statusLabel.setJustificationType (juce::Justification::centredLeft);
+    statusLabel.setMinimumHorizontalScale (1.0f);
 
-    // Surface (a single knob for now)
-    surfaceTitle.setText ("Surface", juce::dontSendNotification);
-    surfaceTitle.setFont (makeFont (15.0f, juce::Font::bold));
-
-    surfaceKnob.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
-    surfaceKnob.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 70, 18);
-    surfaceKnob.setNumDecimalPlacesToDisplay (2);
-
-    // The knob binds to a pool slot, never to the hosted parameter directly.
-    knobAttachment = std::make_unique<juce::SliderParameterAttachment> (*proc.getPoolParameter (kSurfaceSlot),
-                                                                         surfaceKnob, nullptr);
-
-    knobLabel.setJustificationType (juce::Justification::centredLeft);
-
-    mapBox.onChange = [this]
-    {
-        const int id = mapBox.getSelectedId();
-
-        if (id == 1)
-            proc.unmapSlot (kSurfaceSlot);
-        else if (id > 1)
-            proc.mapSlot (kSurfaceSlot, id - 2);
-    };
+    canvas.onSelectionChanged = [this] { updateButtons(); };
+    canvas.onOpenNode         = [this] (NodeUid uid) { openNodeWindow (uid); };
+    canvas.onContextMenu      = [this] { showContextMenu(); };
 
     proc.addChangeListener (this);
     proc.knownPlugins.addChangeListener (this);
 
+    setResizable (true, true);
+    setResizeLimits (820, 560, 2000, 1400);
+    setSize (1040, 680);
     refresh();
-    setSize (560, 450);
 }
 
 UltrapatcherEditor::~UltrapatcherEditor()
 {
     proc.removeChangeListener (this);
     proc.knownPlugins.removeChangeListener (this);
-    pluginWindow.reset();   // hosted editor must die before anything else
+    pluginWindows.clear();   // hosted editors must die before anything else
     settingsWindow.reset();
 }
 
@@ -287,40 +280,36 @@ void UltrapatcherEditor::paintOverChildren (juce::Graphics& g)
     g.drawRoundedRectangle (r, 8.0f, 2.5f);
     g.setColour (juce::Colours::white);
     g.setFont (makeFont (20.0f, juce::Font::bold));
-    g.drawText ("Drop a VST3 plugin to load it", getLocalBounds(), juce::Justification::centred);
+    g.drawText ("Drop a VST3 plugin to add it", getLocalBounds(), juce::Justification::centred);
 }
 
 void UltrapatcherEditor::resized()
 {
-    auto area = getLocalBounds().reduced (12);
+    auto area = getLocalBounds().reduced (10);
 
     auto bar = area.removeFromTop (30);
     settingsButton.setBounds (bar.removeFromRight (90));
     scanButton.setBounds   (bar.removeFromLeft (80));  bar.removeFromLeft (6);
-    loadButton.setBounds   (bar.removeFromLeft (70));  bar.removeFromLeft (6);
-    unloadButton.setBounds (bar.removeFromLeft (70));  bar.removeFromLeft (6);
+    addButton.setBounds    (bar.removeFromLeft (70));  bar.removeFromLeft (6);
+    removeButton.setBounds (bar.removeFromLeft (80));  bar.removeFromLeft (6);
     openButton.setBounds   (bar.removeFromLeft (70));  bar.removeFromLeft (6);
+    bypassButton.setBounds (bar.removeFromLeft (80));  bar.removeFromLeft (6);
     pinButton.setBounds    (bar.removeFromLeft (60));
 
     area.removeFromTop (8);
-    searchBox.setBounds (area.removeFromTop (28));
 
-    area.removeFromTop (8);
-    auto surfaceArea = area.removeFromBottom (110 + 4 + 22 + 14 + 22 + 6);
-    listBox.setBounds (area.withTrimmedBottom (6));
+    auto left = area.removeFromLeft (260);
+    area.removeFromLeft (8);
 
-    statusLabel.setBounds (surfaceArea.removeFromTop (22));
-    surfaceArea.removeFromTop (14);
-    surfaceTitle.setBounds (surfaceArea.removeFromTop (22));
-    surfaceArea.removeFromTop (4);
+    searchBox.setBounds (left.removeFromTop (28));
+    left.removeFromTop (8);
+    statusLabel.setBounds (left.removeFromBottom (44));
+    left.removeFromBottom (6);
+    listBox.setBounds (left);
 
-    auto surfaceRow = surfaceArea.removeFromTop (110);
-    surfaceKnob.setBounds (surfaceRow.removeFromLeft (100));
-    surfaceRow.removeFromLeft (12);
-    surfaceRow.removeFromTop (14);
-    knobLabel.setBounds (surfaceRow.removeFromTop (24));
-    surfaceRow.removeFromTop (6);
-    mapBox.setBounds (surfaceRow.removeFromTop (28));
+    surface.setBounds (area.removeFromBottom (170));
+    area.removeFromBottom (8);
+    canvas.setBounds (area);
 }
 
 void UltrapatcherEditor::mouseDown (const juce::MouseEvent& e)
@@ -330,7 +319,7 @@ void UltrapatcherEditor::mouseDown (const juce::MouseEvent& e)
 }
 
 //==============================================================================
-// Drag and drop: any .vst3 dropped on the window is loaded.
+// Drag and drop: any .vst3 dropped on the window is added to the patch.
 bool UltrapatcherEditor::isInterestedInFileDrag (const juce::StringArray& files)
 {
     for (const auto& f : files)
@@ -386,27 +375,25 @@ void UltrapatcherEditor::paintListBoxItem (int row, juce::Graphics& g, int width
     const auto textColour = getLookAndFeel().findColour (juce::ListBox::textColourId);
 
     auto area = juce::Rectangle<int> (0, 0, width, height).reduced (8, 0);
-    auto right = area.removeFromRight (width / 2 - 8);
 
     g.setColour (textColour);
-    g.setFont (makeFont (15.0f));
-    g.drawText (d.name, area, juce::Justification::centredLeft, true);
+    g.setFont (makeFont (14.5f));
+    g.drawText (d.name, area.removeFromTop (height * 11 / 20), juce::Justification::bottomLeft, true);
 
-    g.setColour (textColour.withAlpha (0.6f));
-    g.setFont (makeFont (13.0f));
-    g.drawText (d.manufacturerName + "   |   " + d.pluginFormatName, right,
-                juce::Justification::centredRight, true);
+    g.setColour (textColour.withAlpha (0.55f));
+    g.setFont (makeFont (11.0f));
+    g.drawText (d.manufacturerName + "  |  " + d.pluginFormatName, area, juce::Justification::topLeft, true);
 }
 
 void UltrapatcherEditor::selectedRowsChanged (int)
 {
-    loadButton.setEnabled (listBox.getSelectedRow() >= 0);
+    updateButtons();
 }
 
 void UltrapatcherEditor::listBoxItemDoubleClicked (int row, const juce::MouseEvent&)
 {
     listBox.selectRow (row);
-    loadSelected();
+    addSelectedPlugin();
 }
 
 void UltrapatcherEditor::listBoxItemClicked (int, const juce::MouseEvent& e)
@@ -424,10 +411,16 @@ void UltrapatcherEditor::backgroundClicked (const juce::MouseEvent& e)
 //==============================================================================
 void UltrapatcherEditor::changeListenerCallback (juce::ChangeBroadcaster* source)
 {
-    // The hosted plugin is about to be replaced: destroy its GUI first.
-    if (source == &proc && proc.isHostedChanging())
+    // A node is about to be removed: destroy its plugin window first.
+    if (source == &proc && proc.isStructureChanging())
     {
-        pluginWindow.reset();
+        const auto uid = proc.getChangingUid();
+
+        if (uid == 0)
+            pluginWindows.clear();
+        else
+            pluginWindows.erase (uid);
+
         return;
     }
 
@@ -454,22 +447,16 @@ void UltrapatcherEditor::refresh()
 
     applyFilter();
 
-    const bool hosting = proc.getHostedPlugin() != nullptr;
+    canvas.refresh();
+    surface.refresh();
+    lastPatchGeneration = proc.getPatchGeneration();
 
-    scanButton.setEnabled (! proc.isScanning());
-    unloadButton.setEnabled (hosting);
-    openButton.setEnabled (hosting);
     pinButton.setToggleState (proc.isWindowAlwaysOnTop(), juce::dontSendNotification);
 
-    if (pluginWindow != nullptr)
-        pluginWindow->setAlwaysOnTop (proc.isWindowAlwaysOnTop());
+    for (auto& entry : pluginWindows)
+        entry.second->setAlwaysOnTop (proc.isWindowAlwaysOnTop());
 
-    refreshMapBox();
-    mapBox.setEnabled (hosting);
-
-    const auto mappedName = proc.getSlotName (kSurfaceSlot);
-    knobLabel.setText (mappedName.isNotEmpty() ? mappedName : "Not mapped", juce::dontSendNotification);
-
+    updateButtons();
     updateStatus();
 }
 
@@ -503,8 +490,28 @@ void UltrapatcherEditor::applyFilter()
         listBox.deselectAllRows();
 
     listBox.repaint();
-    loadButton.setEnabled (listBox.getSelectedRow() >= 0);
+    updateButtons();
     updateStatus();
+}
+
+void UltrapatcherEditor::updateButtons()
+{
+    const auto selected = canvas.getSelectedNode();
+    const bool pluginSelected = selected != 0 && selected != kInputUid && selected != kOutputUid;
+
+    scanButton.setEnabled (! proc.isScanning());
+    addButton.setEnabled (listBox.getSelectedRow() >= 0);
+    removeButton.setEnabled (pluginSelected);
+    openButton.setEnabled (pluginSelected);
+    bypassButton.setEnabled (pluginSelected);
+
+    bool bypassed = false;
+
+    for (const auto& info : proc.getPatchNodes())
+        if (info.uid == selected)
+            bypassed = info.bypassed;
+
+    bypassButton.setToggleState (pluginSelected && bypassed, juce::dontSendNotification);
 }
 
 void UltrapatcherEditor::updateStatus()
@@ -527,13 +534,17 @@ void UltrapatcherEditor::updateStatus()
         text = proc.getLastError();
         isError = true;
     }
+    else if (proc.getLearnSlot() >= 0)
+    {
+        text = "Learning knob " + juce::String (proc.getLearnSlot() + 1) + ": move a parameter in a plugin window";
+    }
     else
     {
-        const bool hosting = proc.getHostedPlugin() != nullptr;
-
-        text = (hosting ? "Hosting: " + proc.getHostedName() : juce::String ("No plugin loaded (passthrough)"))
-             + "   |   "
-             + (filtering ? juce::String (shown) + " of " + count (total) : count (total));
+        const int inPatch = proc.getPatchNodes().size() - 2;
+        text = (inPatch > 0 ? juce::String (inPatch) + (inPatch == 1 ? " plugin" : " plugins") + " in patch"
+                            : juce::String ("Patch is empty (passthrough)"))
+             + "\n"
+             + (filtering ? juce::String (shown) + " of " + count (total) : count (total)) + " known";
     }
 
     statusLabel.setText (text, juce::dontSendNotification);
@@ -542,33 +553,21 @@ void UltrapatcherEditor::updateStatus()
                                    : getLookAndFeel().findColour (juce::Label::textColourId));
 }
 
-// Rebuilds the parameter list only when the hosted plugin changes: some plugins
-// expose thousands of parameters and refresh() runs on every state change.
-void UltrapatcherEditor::refreshMapBox()
-{
-    const int generation = proc.getHostedGeneration();
-
-    if (generation != mapBoxGeneration)
-    {
-        mapBoxGeneration = generation;
-        mapBox.clear (juce::dontSendNotification);
-        mapBox.addItem ("(not mapped)", 1);
-
-        for (const auto& info : proc.getHostedParameterList())
-            mapBox.addItem (info.name, info.index + 2);
-    }
-
-    const int mapped = proc.getSlotMapping (kSurfaceSlot);
-    mapBox.setSelectedId (mapped >= 0 ? mapped + 2 : 1, juce::dontSendNotification);
-}
-
 //==============================================================================
-void UltrapatcherEditor::loadSelected()
+void UltrapatcherEditor::addSelectedPlugin()
 {
     const int row = listBox.getSelectedRow();
 
     if (juce::isPositiveAndBelow (row, shownTypes.size()))
-        proc.loadPlugin (shownTypes.getReference (row));
+        proc.addPlugin (shownTypes.getReference (row));
+}
+
+void UltrapatcherEditor::removeSelectedNode()
+{
+    const auto uid = canvas.getSelectedNode();
+
+    if (uid != 0 && uid != kInputUid && uid != kOutputUid)
+        proc.removeNode (uid);
 }
 
 void UltrapatcherEditor::chooseAndLoadPluginFile()
@@ -631,34 +630,34 @@ void UltrapatcherEditor::openSettings()
     });
 }
 
-void UltrapatcherEditor::openHostedEditor()
+void UltrapatcherEditor::openNodeWindow (NodeUid uid)
 {
-    if (pluginWindow != nullptr)
+    if (auto it = pluginWindows.find (uid); it != pluginWindows.end())
     {
-        pluginWindow->toFront (true);
+        it->second->toFront (true);
         return;
     }
 
-    auto* plugin = proc.getHostedPlugin();
+    auto* hostedProcessor = proc.getNodeProcessor (uid);
 
-    if (plugin == nullptr || ! plugin->hasEditor())
+    if (hostedProcessor == nullptr || ! hostedProcessor->hasEditor())
         return;
 
-    auto* hostedEditor = plugin->createEditorAndMakeActive();
+    auto* hostedEditor = hostedProcessor->createEditorAndMakeActive();
 
     if (hostedEditor == nullptr)
         return;
 
     juce::Component::SafePointer<UltrapatcherEditor> safeThis (this);
 
-    pluginWindow = std::make_unique<HostedPluginWindow> (hostedEditor, proc.getHostedName(),
-                                                         proc.isWindowAlwaysOnTop(), [safeThis]
+    pluginWindows[uid] = std::make_unique<HostedPluginWindow> (hostedEditor, proc.getNodeName (uid),
+                                                               proc.isWindowAlwaysOnTop(), [safeThis, uid]
     {
         // Defer: this runs inside the window's own button handler.
-        juce::MessageManager::callAsync ([safeThis]
+        juce::MessageManager::callAsync ([safeThis, uid]
         {
             if (safeThis != nullptr)
-                safeThis->pluginWindow.reset();
+                safeThis->pluginWindows.erase (uid);
         });
     });
 }

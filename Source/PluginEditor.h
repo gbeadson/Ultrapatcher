@@ -1,12 +1,14 @@
 #pragma once
 
 #include "PluginProcessor.h"
+#include "PatchCanvas.h"
+#include "SurfacePanel.h"
 
 class HostedPluginWindow;
 class SettingsWindow;
 
-// Main UI: toolbar, searchable plugin list, status line, Surface (one knob),
-// settings window, right-click menu and VST3 drag and drop.
+// Patcher mode UI: toolbar, searchable plugin list on the left, the patch
+// canvas in the middle, the Surface along the bottom.
 class UltrapatcherEditor : public juce::AudioProcessorEditor,
                            public juce::FileDragAndDropTarget,
                            private juce::ChangeListener,
@@ -32,8 +34,6 @@ public:
     void filesDropped (const juce::StringArray& files, int x, int y) override;
 
 private:
-    static constexpr int kSurfaceSlot = 0; // the knob is bound to pool slot 1
-
     // ListBoxModel
     int getNumRows() override;
     void paintListBoxItem (int row, juce::Graphics&, int width, int height, bool selected) override;
@@ -45,21 +45,23 @@ private:
     void changeListenerCallback (juce::ChangeBroadcaster*) override;
     void refresh();
     void applyFilter();
-    void refreshMapBox();
     void updateStatus();
+    void updateButtons();
     juce::String getSelectedIdentifier() const;
-    void loadSelected();
+    void addSelectedPlugin();
+    void removeSelectedNode();
     void showContextMenu();
     void openSettings();
-    void openHostedEditor();
+    void openNodeWindow (NodeUid);
 
     UltrapatcherProcessor& proc;
 
     // Toolbar
     juce::TextButton scanButton     { "Scan" };
-    juce::TextButton loadButton     { "Load" };
-    juce::TextButton unloadButton   { "Unload" };
+    juce::TextButton addButton      { "Add" };
+    juce::TextButton removeButton   { "Remove" };
     juce::TextButton openButton     { "Open" };
+    juce::TextButton bypassButton   { "Bypass" };
     juce::TextButton pinButton      { "Pin" };
     juce::TextButton settingsButton { "Settings" };
 
@@ -68,18 +70,14 @@ private:
     juce::ListBox    listBox { "plugins", this };
     juce::Label      statusLabel;
 
-    // Surface (milestone 2: a single knob)
-    juce::Label      surfaceTitle;
-    juce::Slider     surfaceKnob;
-    juce::Label      knobLabel;
-    juce::ComboBox   mapBox;
-    std::unique_ptr<juce::SliderParameterAttachment> knobAttachment;
+    PatchCanvas  canvas;
+    SurfacePanel surface;
 
     juce::Array<juce::PluginDescription> allTypes, shownTypes;
-    std::unique_ptr<HostedPluginWindow> pluginWindow;
+    std::map<NodeUid, std::unique_ptr<HostedPluginWindow>> pluginWindows;
     std::unique_ptr<SettingsWindow> settingsWindow;
     std::unique_ptr<juce::FileChooser> fileChooser;
-    int mapBoxGeneration = -1; // which hosted plugin mapBox was built for
+    int lastPatchGeneration = -1;
     bool dragHover = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (UltrapatcherEditor)

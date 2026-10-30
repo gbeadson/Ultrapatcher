@@ -20,6 +20,10 @@ juce_add_plugin(Ultrapatcher
 
 target_sources(Ultrapatcher PRIVATE
     Source/PluginProcessor.cpp
+    Source/PatchEngine.cpp
+    Source/Mapping.cpp
+    Source/PatchCanvas.cpp
+    Source/SurfacePanel.cpp
     Source/PluginEditor.cpp)
 
 target_compile_definitions(Ultrapatcher PUBLIC

@@ -3,31 +3,56 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include "Settings.h"
 
-// Milestone 2: hosts one third-party plugin and exposes a fixed pool of generic
-// DAW parameters ("Param 1".."Param 128") that can be mapped to the hosted
-// plugin's parameters. Surface controls bind to pool slots, never directly to
-// hosted parameters, so automation, MIDI learn and project reload behave the
-// same everywhere.
+class PoolParameter;
+
+// Ids for patch nodes. 1 and 2 are the fixed Input and Output nodes.
+using NodeUid = uint32_t;
+constexpr NodeUid kInputUid = 1;
+constexpr NodeUid kOutputUid = 2;
+constexpr NodeUid kFirstPluginUid = 3;
+
+// What the canvas needs to draw one node.
+struct PatchNodeInfo
+{
+    NodeUid uid = 0;
+    juce::String name, subtitle;
+    bool isIO = false, bypassed = false;
+    juce::Point<float> pos;
+    int audioIns = 0, audioOuts = 0;
+    bool acceptsMidi = false, producesMidi = false;
+};
+
+// A cable from one node's output to another node's input. Audio cords carry
+// the stereo pair (like the Grid's stereo signals); MIDI cords carry notes and
+// control messages.
+struct Cord
+{
+    NodeUid src = 0, dst = 0;
+    bool midi = false;
+
+    bool operator== (const Cord& o) const noexcept { return src == o.src && dst == o.dst && midi == o.midi; }
+};
+
+// One parameter a knob drives. The knob's 0..1 maps to rangeMin..rangeMax,
+// so a reversed range (min > max) inverts the control.
+struct MapTarget
+{
+    NodeUid uid = 0;
+    int paramIndex = -1;
+    juce::String nodeName, paramName;
+    float rangeMin = 0.0f, rangeMax = 1.0f;
+};
+
+// Patcher mode: any number of hosted plugins wired with cords. Eight Surface
+// knobs (out of a pool of 128 DAW parameters) can each drive many hosted
+// parameters, each with its own range. Learn mode maps by touch.
 class UltrapatcherProcessor : public juce::AudioProcessor,
                               public juce::ChangeBroadcaster,
                               private juce::Timer
 {
 public:
     static constexpr int kPoolSize = 128;
-
-    // A saved or requested link between a pool slot and a hosted parameter.
-    struct SlotMap
-    {
-        int slot = 0;
-        int hostedIndex = -1;
-        juce::String hostedName;
-    };
-
-    struct HostedParamInfo
-    {
-        int index = 0;
-        juce::String name;
-    };
+    static constexpr int kKnobs = 8;
 
     UltrapatcherProcessor();
     ~UltrapatcherProcessor() override;
@@ -55,38 +80,50 @@ public:
     void getStateInformation (juce::MemoryBlock&) override;
     void setStateInformation (const void*, int) override;
 
-    // Hosting. Call from any thread; the work happens on the message thread.
-    void loadPlugin (const juce::PluginDescription&,
-                     const juce::MemoryBlock& state = {},
-                     const std::vector<SlotMap>& maps = {});
-    void unloadPlugin();
-    juce::AudioPluginInstance* getHostedPlugin() const;
-    juce::String getHostedName() const { return hostedDescription.name; }
+    //==========================================================================
+    // Patch. Message thread, except where noted.
+    juce::Array<PatchNodeInfo> getPatchNodes() const;   // Input, Output, then plugins
+    std::vector<Cord> getCords() const { return cords; }
+    int getPatchGeneration() const { return patchGeneration.load(); }
 
-    // True while the hosted plugin is about to be replaced. Editors holding
-    // a hosted plugin's GUI must destroy it when they see this flag.
-    bool isHostedChanging() const { return hostedChanging.load(); }
+    void addPlugin (const juce::PluginDescription&, const juce::MemoryBlock& state = {}); // any thread
+    void loadPluginFromFile (const juce::File&);                                          // any thread
+    void removeNode (NodeUid);
+    bool addCord (const Cord&);
+    void removeCord (const Cord&);
+    bool insertNodeOnCord (NodeUid, const Cord&);
+    void setNodeBypassed (NodeUid, bool);
+    void setNodePosition (NodeUid, juce::Point<float>);
+
+    juce::AudioProcessor* getNodeProcessor (NodeUid) const;  // null for Input/Output
+    juce::String getNodeName (NodeUid) const;
+
+    // True while nodes are about to be removed. Editors holding a node's
+    // plugin window must destroy it when they see this. A uid of 0 means all.
+    bool isStructureChanging() const { return structureChanging.load(); }
+    NodeUid getChangingUid() const { return changingUid.load(); }
     juce::String getLastError() const { return lastError; }
 
-    // Incremented every time the hosted plugin is replaced or removed.
-    int getHostedGeneration() const { return hostedGeneration.load(); }
-
-    // Parameter pool (message thread).
+    //==========================================================================
+    // Knob mappings.
     juce::RangedAudioParameter* getPoolParameter (int slot) const;
-    juce::Array<HostedParamInfo> getHostedParameterList() const;
-    bool mapSlot (int slot, int hostedParamIndex);
-    void unmapSlot (int slot);
-    int getSlotMapping (int slot) const;      // hosted parameter index, or -1
-    juce::String getSlotName (int slot) const; // hosted parameter name, or empty
+    std::vector<MapTarget> getSlotTargets (int slot) const;
+    juce::String getSlotDisplayName (int slot) const;
+    void setSlotCustomName (int slot, const juce::String&);
+    bool addTarget (int slot, NodeUid, int paramIndex);
+    void removeTarget (int slot, int targetIndex);
+    void setTargetRange (int slot, int targetIndex, float rangeMin, float rangeMax);
+    void clearSlot (int slot);
 
-    // Plugin scanning (background thread). The normal scan covers each format's
-    // default locations plus the custom folders; customFoldersOnly skips the defaults.
+    // Learn: move a parameter in a plugin window and it is mapped to the knob.
+    void startLearn (int slot);
+    void cancelLearn();
+    int getLearnSlot() const { return learnSlot; }
+
+    //==========================================================================
+    // Plugin scanning (background thread).
     void startScan (bool customFoldersOnly = false);
     bool isScanning() const { return scanning.load(); }
-
-    // Load a plugin by file path (for example a .vst3 picked or dropped by the
-    // user). Any thread. Also adds it to the known-plugin list.
-    void loadPluginFromFile (const juce::File&);
 
     // Settings (message thread). Changes are saved immediately.
     juce::StringArray getScanFolders() const { return settings.scanFolders; }
@@ -100,44 +137,109 @@ public:
 
 private:
     using Node = juce::AudioProcessorGraph::Node;
+    using Conn = juce::AudioProcessorGraph::Connection;
 
     class ScanThread;
-    class PoolParameter;
 
-    // Per-slot sync state. Guarded by mappingLock: the message thread locks
-    // it, the audio thread only try-locks it and skips the block if busy.
-    struct SlotState
+    struct NodeRecord
     {
-        int hostedIndex = -1;
-        float lastPoolApplied = 0.0f;  // last pool value pushed to the hosted plugin
-        float lastHostedSeen  = 0.0f;  // last hosted value seen by either direction
+        NodeUid uid = 0;
+        Node::Ptr graphNode;
+        juce::PluginDescription desc;
+        juce::String name;
+        bool bypassed = false;
+        juce::Point<float> pos;
     };
 
-    void doLoad (const juce::PluginDescription&, const juce::MemoryBlock&, const std::vector<SlotMap>&);
-    void doUnload();
-    void detachHostedNode();
-    void rebuildConnections();
-    void scanFinished();
+    // A patch as stored in the project, before plugins are loaded.
+    struct SavedNode { NodeUid uid = 0; juce::PluginDescription desc; juce::MemoryBlock state; bool bypassed = false; juce::Point<float> pos; };
+    struct SavedKnob { int slot = 0; juce::String name; std::vector<MapTarget> targets; };
+    struct SavedPatch
+    {
+        std::vector<SavedNode> nodes;
+        std::vector<Cord> cords;
+        std::vector<SavedKnob> knobs;
+        juce::Point<float> inputPos { 24.0f, 40.0f }, outputPos { -1.0f, 40.0f };   // x < 0: right-aligned
+        NodeUid nextUid = kFirstPluginUid;
+        bool migrated = false;  // saved by an older version: wire automatically
+    };
+    struct RestoreJob;
+
+    // Live mapping state, shared with the audio thread under mappingLock.
+    struct LiveTarget { juce::AudioProcessorParameter* param = nullptr; float rangeMin = 0.0f, rangeMax = 1.0f; };
+    struct SlotState
+    {
+        std::vector<LiveTarget> targets;
+        bool twoWay = false;           // one identity target: hosted changes flow back to the knob
+        float lastPoolApplied = 0.0f;
+        float lastHostedSeen = 0.0f;
+    };
+    struct KnobMeta { juce::String customName; std::vector<MapTarget> targets; };
+
+    // patch (patch.cpp)
+    NodeRecord* findNode (NodeUid);
+    const NodeRecord* findNode (NodeUid) const;
+    int audioInputsOf (NodeUid) const;
+    int audioOutputsOf (NodeUid) const;
+    bool midiInOf (NodeUid) const;
+    bool midiOutOf (NodeUid) const;
+    juce::AudioProcessorGraph::NodeID graphIdFor (NodeUid, bool midi) const;
+    std::vector<Conn> connectionsFor (const Cord&) const;
+    bool cordIsValid (const Cord&, juce::String& why) const;
+    bool addCordInternal (const Cord&);
+    void removeCordInternal (const Cord&);
+    NodeUid installNode (std::unique_ptr<juce::AudioProcessor>, const juce::PluginDescription&,
+                         NodeUid fixedUid, juce::Point<float> pos, bool bypassed, bool autoWire);
+    void autoWireNode (NodeUid);
+    void doAddPlugin (const juce::PluginDescription&, const juce::MemoryBlock&);
     void doLoadFromFile (const juce::File&);
+    void clearPatch (bool addDefaultCords);
+    void restorePatch (SavedPatch);
+    void finishRestore (SavedPatch&, std::map<NodeUid, std::unique_ptr<juce::AudioPluginInstance>>&);
+    static SavedPatch parsePatch (const juce::XmlElement&);
+    void patchChanged();
+    void beginStructureChange (NodeUid);
+    void endStructureChange();
+    void setError (const juce::String&);
+    void createDefaultCords();
+
+    // mapping (mapping.cpp)
+    void rebuildSlot (int slot);
+    void refreshSlotName (int slot);
+    void dropTargetsForNode (NodeUid);
+    void applyPoolToHosted();
+    void timerCallback() override;
+    void pollLearn();
+
+    // scanning & settings (PluginProcessor.cpp)
+    void scanFinished();
     void savePluginList();
     void saveSettings();
-    void timerCallback() override;
-    void applyPoolToHosted();
     juce::File getSupportDirectory() const;
 
     UltrapatcherSettings settings;
 
     juce::AudioProcessorGraph graph;
-    Node::Ptr audioInNode, audioOutNode, midiInNode, midiOutNode, hostedNode;
-    juce::PluginDescription hostedDescription;
+    Node::Ptr audioInNode, audioOutNode, midiInNode, midiOutNode;
+    std::vector<NodeRecord> nodes;
+    std::vector<Cord> cords;
+    juce::Point<float> inputPos { 24.0f, 40.0f }, outputPos { -1.0f, 40.0f };   // x < 0: right-aligned
+    NodeUid nextUid = kFirstPluginUid;
 
     std::array<PoolParameter*, kPoolSize> pool {};
+    std::array<KnobMeta, kPoolSize> knobs;
     std::array<SlotState, kPoolSize> slots;
     juce::SpinLock mappingLock;
 
-    std::atomic<bool> hostedChanging { false };
-    std::atomic<int> hostedGeneration { 0 };
+    int learnSlot = -1;
+    struct LearnSnap { NodeUid uid; int index; float value; };
+    std::vector<LearnSnap> learnBase;
+
+    std::atomic<int> patchGeneration { 0 };
+    std::atomic<bool> structureChanging { false };
+    std::atomic<NodeUid> changingUid { 0 };
     std::atomic<bool> scanning { false };
+    int restoreGeneration = 0;
     juce::String lastError;
     std::unique_ptr<ScanThread> scanThread;
 

@@ -97,7 +97,7 @@ juce::Array<PatchNodeInfo> UltrapatcherProcessor::getPatchNodes() const
         PatchNodeInfo info;
         info.uid = n.uid;
         info.name = n.name;
-        info.subtitle = n.desc.manufacturerName;
+        info.subtitle = n.isStrip ? juce::String ("Chain mixer") : n.desc.manufacturerName;
         info.bypassed = n.bypassed;
         info.pos = n.pos;
 
@@ -319,6 +319,12 @@ bool UltrapatcherProcessor::addCord (const Cord& c)
 {
     lastError.clear();
 
+    if (mode == RackMode::rack)
+    {
+        setError ("The rack wires itself. Switch to Patcher mode to connect cords by hand.");
+        return false;
+    }
+
     if (addCordInternal (c))
     {
         patchChanged();
@@ -331,6 +337,9 @@ bool UltrapatcherProcessor::addCord (const Cord& c)
 
 void UltrapatcherProcessor::removeCord (const Cord& c)
 {
+    if (mode == RackMode::rack)
+        return;
+
     if (std::find (cords.begin(), cords.end(), c) == cords.end())
         return;
 
@@ -342,6 +351,9 @@ void UltrapatcherProcessor::removeCord (const Cord& c)
 bool UltrapatcherProcessor::insertNodeOnCord (NodeUid uid, const Cord& cord)
 {
     lastError.clear();
+
+    if (mode == RackMode::rack)
+        return false;
 
     if (std::find (cords.begin(), cords.end(), cord) == cords.end() || findNode (uid) == nullptr)
         return false;
@@ -405,7 +417,7 @@ NodeUid UltrapatcherProcessor::installNode (std::unique_ptr<juce::AudioProcessor
     rec.graphNode->setBypassed (bypassed);
     nodes.push_back (rec);
 
-    if (autoWire)
+    if (autoWire && mode == RackMode::patcher)
         autoWireNode (rec.uid);
 
     patchChanged();
@@ -485,8 +497,31 @@ void UltrapatcherProcessor::doAddPlugin (const juce::PluginDescription& desc, co
             if (state.getSize() > 0)
                 instance->setStateInformation (state.getData(), (int) state.getSize());
 
-            weak->installNode (std::move (instance), desc, 0, { -1.0f, -1.0f }, false, true);
+            if (weak->mode == RackMode::rack)
+                weak->installIntoChain (std::move (instance), desc, weak->activeChainId);
+            else
+                weak->installNode (std::move (instance), desc, 0, { -1.0f, -1.0f }, false, true);
         });
+}
+
+// Removes a node and everything that points at it, with no signalling.
+void UltrapatcherProcessor::removeNodeCore (NodeUid uid)
+{
+    auto* rec = findNode (uid);
+
+    if (rec == nullptr)
+        return;
+
+    dropTargetsForNode (uid);
+
+    for (const auto& c : std::vector<Cord> (cords))
+        if (c.src == uid || c.dst == uid)
+            removeCordInternal (c);
+
+    graph.removeNode (rec->graphNode->nodeID, UpdateKind::none);
+    nodes.erase (std::remove_if (nodes.begin(), nodes.end(),
+                                 [uid] (const NodeRecord& n) { return n.uid == uid; }),
+                 nodes.end());
 }
 
 void UltrapatcherProcessor::removeNode (NodeUid uid)
@@ -496,37 +531,43 @@ void UltrapatcherProcessor::removeNode (NodeUid uid)
     if (rec == nullptr)
         return;
 
+    // A rack's mixer strips go with their chain, never on their own.
+    if (mode == RackMode::rack && rec->isStrip)
+        return;
+
     beginStructureChange (uid);
 
-    // Keep the signal flowing: whatever fed this node now feeds whatever it fed.
-    for (bool midi : { false, true })
+    if (mode == RackMode::rack)
     {
-        std::vector<Cord> ins, outs;
-
-        for (const auto& c : cords)
+        if (auto* chain = chainOfDevice (uid))
+            chain->devices.erase (std::remove (chain->devices.begin(), chain->devices.end(), uid), chain->devices.end());
+    }
+    else
+    {
+        // Keep the signal flowing: whatever fed this node now feeds whatever it fed.
+        for (bool midi : { false, true })
         {
-            if (c.midi != midi) continue;
-            if (c.dst == uid) ins.push_back (c);
-            if (c.src == uid) outs.push_back (c);
+            std::vector<Cord> ins, outs;
+
+            for (const auto& c : cords)
+            {
+                if (c.midi != midi) continue;
+                if (c.dst == uid) ins.push_back (c);
+                if (c.src == uid) outs.push_back (c);
+            }
+
+            for (const auto& i : ins)
+                for (const auto& o : outs)
+                    addCordInternal ({ i.src, o.dst, midi });
         }
 
-        for (const auto& i : ins)
-            for (const auto& o : outs)
-                addCordInternal ({ i.src, o.dst, midi });
+        lastError.clear();
     }
 
-    lastError.clear();
+    removeNodeCore (uid);
 
-    for (const auto& c : std::vector<Cord> (cords))
-        if (c.src == uid || c.dst == uid)
-            removeCordInternal (c);
-
-    dropTargetsForNode (uid);
-
-    graph.removeNode (rec->graphNode->nodeID, UpdateKind::none);
-    nodes.erase (std::remove_if (nodes.begin(), nodes.end(),
-                                 [uid] (const NodeRecord& n) { return n.uid == uid; }),
-                 nodes.end());
+    if (mode == RackMode::rack)
+        rebuildRackWiring();
 
     endStructureChange();
     patchChanged();
@@ -612,7 +653,8 @@ void UltrapatcherProcessor::getStateInformation (juce::MemoryBlock& destData)
     }
 
     juce::XmlElement xml ("Ultrapatcher");
-    xml.setAttribute ("version", 3);
+    xml.setAttribute ("version", 4);
+    xml.setAttribute ("mode", mode == RackMode::rack ? "rack" : "patcher");
     xml.setAttribute ("nextUid", (int) nextUid);
 
     auto* io = xml.createNewChildElement ("IO");
@@ -636,7 +678,25 @@ void UltrapatcherProcessor::getStateInformation (juce::MemoryBlock& destData)
         juce::MemoryBlock state;
         n.graphNode->getProcessor()->getStateInformation (state);
         e->setAttribute ("state", state.toBase64Encoding());
-        e->addChildElement (n.desc.createXml().release());
+
+        if (n.isStrip)
+            e->setAttribute ("kind", "strip");
+        else
+            e->addChildElement (n.desc.createXml().release());
+    }
+
+    auto* rackXml = xml.createNewChildElement ("RACK");
+    rackXml->setAttribute ("nextChainId", nextChainId);
+
+    for (const auto& chain : chains)
+    {
+        auto* ce = rackXml->createNewChildElement ("CHAIN");
+        ce->setAttribute ("id", chain.id);
+        ce->setAttribute ("name", chain.name);
+        ce->setAttribute ("strip", (int) chain.stripUid);
+
+        for (auto device : chain.devices)
+            ce->createNewChildElement ("DEVICE")->setAttribute ("uid", (int) device);
     }
 
     auto* cordsXml = xml.createNewChildElement ("CORDS");
@@ -704,15 +764,40 @@ UltrapatcherProcessor::SavedPatch UltrapatcherProcessor::parsePatch (const juce:
             {
                 SavedNode sn;
                 sn.uid = (NodeUid) e->getIntAttribute ("uid", 0);
+                sn.isStrip = e->getStringAttribute ("kind") == "strip";
                 auto* pluginXml = e->getChildByName ("PLUGIN");
 
-                if (sn.uid < kFirstPluginUid || pluginXml == nullptr || ! sn.desc.loadFromXml (*pluginXml))
+                if (sn.uid < kFirstPluginUid)
+                    continue;
+
+                if (! sn.isStrip && (pluginXml == nullptr || ! sn.desc.loadFromXml (*pluginXml)))
                     continue;
 
                 sn.state.fromBase64Encoding (e->getStringAttribute ("state"));
                 sn.bypassed = e->getBoolAttribute ("bypassed", false);
                 sn.pos = readPoint (e, { -1.0f, -1.0f });
                 p.nodes.push_back (std::move (sn));
+            }
+        }
+
+        p.mode = xml.getStringAttribute ("mode") == "rack" ? RackMode::rack : RackMode::patcher;
+
+        if (auto* rackXml = xml.getChildByName ("RACK"))
+        {
+            p.nextChainId = juce::jmax (1, rackXml->getIntAttribute ("nextChainId", 1));
+
+            for (auto* ce : rackXml->getChildWithTagNameIterator ("CHAIN"))
+            {
+                SavedChain chain;
+                chain.id = ce->getIntAttribute ("id", 0);
+                chain.name = ce->getStringAttribute ("name");
+                chain.stripUid = (NodeUid) ce->getIntAttribute ("strip", 0);
+
+                for (auto* de : ce->getChildWithTagNameIterator ("DEVICE"))
+                    chain.devices.push_back ((NodeUid) de->getIntAttribute ("uid", 0));
+
+                if (chain.id > 0)
+                    p.chains.push_back (std::move (chain));
             }
         }
 
@@ -838,6 +923,10 @@ void UltrapatcherProcessor::clearPatch (bool addDefaultCords)
         graph.removeConnection (conn, UpdateKind::none);
 
     cords.clear();
+    mode = RackMode::patcher;
+    chains.clear();
+    nextChainId = 1;
+    activeChainId = 0;
 
     if (addDefaultCords)
         createDefaultCords();
@@ -859,7 +948,8 @@ void UltrapatcherProcessor::restorePatch (SavedPatch patch)
 
     auto job = std::make_shared<RestoreJob>();
     job->patch = std::move (patch);
-    job->remaining = (int) job->patch.nodes.size();
+    job->remaining = (int) std::count_if (job->patch.nodes.begin(), job->patch.nodes.end(),
+                                          [] (const SavedNode& n) { return ! n.isStrip; });
     job->generation = generation;
 
     if (job->remaining == 0)
@@ -875,6 +965,9 @@ void UltrapatcherProcessor::restorePatch (SavedPatch patch)
 
     for (const auto& sn : job->patch.nodes)
     {
+        if (sn.isStrip)
+            continue;
+
         formatManager.createPluginInstanceAsync (sn.desc, sr, bs,
             [weak, job, uid = sn.uid] (std::unique_ptr<juce::AudioPluginInstance> instance, const juce::String&)
             {
@@ -899,6 +992,12 @@ void UltrapatcherProcessor::finishRestore (SavedPatch& patch,
 
     for (const auto& sn : patch.nodes)
     {
+        if (sn.isStrip)
+        {
+            installStrip (sn.uid, sn.state);
+            continue;
+        }
+
         auto it = instances.find (sn.uid);
 
         if (it == instances.end() || it->second == nullptr)
@@ -915,8 +1014,41 @@ void UltrapatcherProcessor::finishRestore (SavedPatch& patch,
         installNode (std::move (instance), sn.desc, sn.uid, sn.pos, sn.bypassed, patch.migrated);
     }
 
-    for (const auto& c : patch.cords)
-        addCordInternal (c);
+    if (patch.mode == RackMode::rack)
+    {
+        // The rack regenerates its own cords. Keep only chains whose mixer
+        // survived, and only devices that loaded.
+        mode = RackMode::rack;
+        nextChainId = juce::jmax (1, patch.nextChainId);
+
+        for (const auto& sc : patch.chains)
+        {
+            const auto* strip = findNode (sc.stripUid);
+
+            if (strip == nullptr || ! strip->isStrip)
+                continue;
+
+            ChainRecord chain;
+            chain.id = sc.id;
+            chain.name = sc.name.isNotEmpty() ? sc.name : "Chain " + juce::String (sc.id);
+            chain.stripUid = sc.stripUid;
+
+            for (auto device : sc.devices)
+                if (findNode (device) != nullptr)
+                    chain.devices.push_back (device);
+
+            nextChainId = juce::jmax (nextChainId, chain.id + 1);
+            chains.push_back (std::move (chain));
+        }
+
+        activeChainId = chains.empty() ? 0 : chains.front().id;
+        rebuildRackWiring();
+    }
+    else
+    {
+        for (const auto& c : patch.cords)
+            addCordInternal (c);
+    }
 
     // Mappings: match by uid, then by parameter name, then by index.
     for (const auto& k : patch.knobs)

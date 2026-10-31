@@ -244,6 +244,7 @@ void UltrapatcherProcessor::applyPoolToHosted()
 
 void UltrapatcherProcessor::timerCallback()
 {
+    updateSoloSuppression();
     pollLearn();
 
     std::vector<std::pair<int, float>> updates;

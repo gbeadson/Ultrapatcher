@@ -202,12 +202,16 @@ static bool isVst3Path (const juce::String& path)
 }
 
 UltrapatcherEditor::UltrapatcherEditor (UltrapatcherProcessor& p)
-    : juce::AudioProcessorEditor (&p), proc (p), canvas (p), surface (p)
+    : juce::AudioProcessorEditor (&p), proc (p), canvas (p), rackView (p), surface (p)
 {
-    for (auto* c : std::initializer_list<juce::Component*> { &scanButton, &addButton, &removeButton, &openButton,
-                                                              &bypassButton, &pinButton, &settingsButton,
-                                                              &searchBox, &listBox, &statusLabel, &canvas, &surface })
+    for (auto* c : std::initializer_list<juce::Component*> { &patcherButton, &rackButton, &scanButton, &addButton,
+                                                              &removeButton, &openButton, &bypassButton, &pinButton,
+                                                              &settingsButton, &searchBox, &listBox, &statusLabel,
+                                                              &canvas, &rackView, &surface })
         addAndMakeVisible (c);
+
+    patcherButton.onClick = [this] { requestMode (RackMode::patcher); };
+    rackButton.onClick    = [this] { requestMode (RackMode::rack); };
 
     // Toolbar
     bypassButton.setClickingTogglesState (false);
@@ -215,19 +219,12 @@ UltrapatcherEditor::UltrapatcherEditor (UltrapatcherProcessor& p)
 
     scanButton.onClick     = [this] { proc.startScan(); };
     addButton.onClick      = [this] { addSelectedPlugin(); };
-    removeButton.onClick   = [this] { removeSelectedNode(); };
-    openButton.onClick     = [this] { openNodeWindow (canvas.getSelectedNode()); };
+    removeButton.onClick   = [this] { removeSelection(); };
+    openButton.onClick     = [this] { for (auto uid : selectedPlugins()) openNodeWindow (uid); };
     pinButton.onClick      = [this] { proc.setWindowAlwaysOnTop (pinButton.getToggleState()); };
     settingsButton.onClick = [this] { openSettings(); };
 
-    bypassButton.onClick = [this]
-    {
-        const auto uid = canvas.getSelectedNode();
-
-        for (const auto& info : proc.getPatchNodes())
-            if (info.uid == uid && ! info.isIO)
-                proc.setNodeBypassed (uid, ! info.bypassed);
-    };
+    bypassButton.onClick = [this] { toggleBypassOnSelection(); };
 
     // Search and list
     searchBox.setTextToShowWhenEmpty ("Search plugins...", juce::Colours::grey);
@@ -244,6 +241,15 @@ UltrapatcherEditor::UltrapatcherEditor (UltrapatcherProcessor& p)
     canvas.onSelectionChanged = [this] { updateButtons(); };
     canvas.onOpenNode         = [this] (NodeUid uid) { openNodeWindow (uid); };
     canvas.onContextMenu      = [this] { showContextMenu(); };
+
+    rackView.onSelectionChanged = [this] { updateButtons(); };
+    rackView.onOpenDevice       = [this] (NodeUid uid) { openNodeWindow (uid); };
+    rackView.onContextMenu      = [this] { showContextMenu(); };
+    rackView.onAddToChain       = [this] (int chainId)
+    {
+        proc.setActiveChain (chainId);
+        addSelectedPlugin();
+    };
 
     proc.addChangeListener (this);
     proc.knownPlugins.addChangeListener (this);
@@ -289,6 +295,8 @@ void UltrapatcherEditor::resized()
 
     auto bar = area.removeFromTop (30);
     settingsButton.setBounds (bar.removeFromRight (90));
+    patcherButton.setBounds (bar.removeFromLeft (80)); bar.removeFromLeft (4);
+    rackButton.setBounds    (bar.removeFromLeft (64)); bar.removeFromLeft (18);
     scanButton.setBounds   (bar.removeFromLeft (80));  bar.removeFromLeft (6);
     addButton.setBounds    (bar.removeFromLeft (70));  bar.removeFromLeft (6);
     removeButton.setBounds (bar.removeFromLeft (80));  bar.removeFromLeft (6);
@@ -310,6 +318,7 @@ void UltrapatcherEditor::resized()
     surface.setBounds (area.removeFromBottom (170));
     area.removeFromBottom (8);
     canvas.setBounds (area);
+    rackView.setBounds (area);
 }
 
 void UltrapatcherEditor::mouseDown (const juce::MouseEvent& e)
@@ -416,6 +425,8 @@ void UltrapatcherEditor::changeListenerCallback (juce::ChangeBroadcaster* source
     {
         const auto uid = proc.getChangingUid();
 
+        rackView.releaseRows();   // rows hold parameter attachments into nodes about to be destroyed
+
         if (uid == 0)
             pluginWindows.clear();
         else
@@ -447,7 +458,14 @@ void UltrapatcherEditor::refresh()
 
     applyFilter();
 
+    const bool rack = proc.getMode() == RackMode::rack;
+    canvas.setVisible (! rack);
+    rackView.setVisible (rack);
+    patcherButton.setToggleState (! rack, juce::dontSendNotification);
+    rackButton.setToggleState (rack, juce::dontSendNotification);
+
     canvas.refresh();
+    rackView.refresh();
     surface.refresh();
     lastPatchGeneration = proc.getPatchGeneration();
 
@@ -494,24 +512,43 @@ void UltrapatcherEditor::applyFilter()
     updateStatus();
 }
 
+std::vector<NodeUid> UltrapatcherEditor::selectedPlugins() const
+{
+    std::vector<NodeUid> list;
+
+    if (proc.getMode() == RackMode::rack)
+    {
+        if (rackView.getSelectedDevice() != 0)
+            list.push_back (rackView.getSelectedDevice());
+    }
+    else
+    {
+        for (auto uid : canvas.getSelectedNodes())
+            if (uid != kInputUid && uid != kOutputUid)
+                list.push_back (uid);
+    }
+
+    return list;
+}
+
 void UltrapatcherEditor::updateButtons()
 {
-    const auto selected = canvas.getSelectedNode();
-    const bool pluginSelected = selected != 0 && selected != kInputUid && selected != kOutputUid;
+    const auto selection = selectedPlugins();
+    const bool any = ! selection.empty();
 
     scanButton.setEnabled (! proc.isScanning());
     addButton.setEnabled (listBox.getSelectedRow() >= 0);
-    removeButton.setEnabled (pluginSelected);
-    openButton.setEnabled (pluginSelected);
-    bypassButton.setEnabled (pluginSelected);
+    removeButton.setEnabled (any);
+    openButton.setEnabled (any);
+    bypassButton.setEnabled (any);
 
-    bool bypassed = false;
+    bool allBypassed = any;
 
     for (const auto& info : proc.getPatchNodes())
-        if (info.uid == selected)
-            bypassed = info.bypassed;
+        if (std::find (selection.begin(), selection.end(), info.uid) != selection.end())
+            allBypassed = allBypassed && info.bypassed;
 
-    bypassButton.setToggleState (pluginSelected && bypassed, juce::dontSendNotification);
+    bypassButton.setToggleState (allBypassed, juce::dontSendNotification);
 }
 
 void UltrapatcherEditor::updateStatus()
@@ -540,9 +577,20 @@ void UltrapatcherEditor::updateStatus()
     }
     else
     {
-        const int inPatch = proc.getPatchNodes().size() - 2;
-        text = (inPatch > 0 ? juce::String (inPatch) + (inPatch == 1 ? " plugin" : " plugins") + " in patch"
-                            : juce::String ("Patch is empty (passthrough)"))
+        int inPatch = 0;
+
+        for (const auto& info : proc.getPatchNodes())
+            if (! info.isIO && info.subtitle != "Chain mixer")
+                ++inPatch;
+
+        const auto chainCount = (int) proc.getChains().size();
+        const auto where = proc.getMode() == RackMode::rack
+                             ? juce::String (chainCount) + (chainCount == 1 ? " chain, " : " chains, ")
+                                 + juce::String (inPatch) + (inPatch == 1 ? " device" : " devices")
+                             : (inPatch > 0 ? juce::String (inPatch) + (inPatch == 1 ? " plugin" : " plugins") + " in patch"
+                                            : juce::String ("Patch is empty (passthrough)"));
+
+        text = where
              + "\n"
              + (filtering ? juce::String (shown) + " of " + count (total) : count (total)) + " known";
     }
@@ -562,12 +610,64 @@ void UltrapatcherEditor::addSelectedPlugin()
         proc.addPlugin (shownTypes.getReference (row));
 }
 
-void UltrapatcherEditor::removeSelectedNode()
+void UltrapatcherEditor::removeSelection()
 {
-    const auto uid = canvas.getSelectedNode();
+    if (proc.getMode() == RackMode::rack)
+    {
+        if (const auto uid = rackView.getSelectedDevice(); uid != 0)
+            proc.removeNode (uid);
+    }
+    else
+    {
+        canvas.deleteSelection();
+    }
+}
 
-    if (uid != 0 && uid != kInputUid && uid != kOutputUid)
-        proc.removeNode (uid);
+void UltrapatcherEditor::toggleBypassOnSelection()
+{
+    const auto selection = selectedPlugins();
+    bool allBypassed = ! selection.empty();
+
+    for (const auto& info : proc.getPatchNodes())
+        if (std::find (selection.begin(), selection.end(), info.uid) != selection.end())
+            allBypassed = allBypassed && info.bypassed;
+
+    for (auto uid : selection)
+        proc.setNodeBypassed (uid, ! allBypassed);
+}
+
+// Patcher to Rack starts a fresh rack (a free-form graph has no rack form),
+// so it asks first when there is something to lose. Rack to Patcher is lossless.
+void UltrapatcherEditor::requestMode (RackMode newMode)
+{
+    if (newMode == proc.getMode())
+    {
+        refresh();
+        return;
+    }
+
+    if (newMode == RackMode::rack && proc.getPatchNodes().size() > 2)
+    {
+        juce::Component::SafePointer<UltrapatcherEditor> safeThis (this);
+
+        juce::AlertWindow::showOkCancelBox (
+            juce::MessageBoxIconType::WarningIcon,
+            "Switch to Rack mode?",
+            "A free-form patch cannot be turned into a rack, so this starts a new, empty rack. "
+            "The plugins, cords and knob mappings in the current patch will be removed.\n\n"
+            "Switching back to Patcher mode later keeps whatever is in the rack.",
+            "Switch to Rack", "Cancel", this,
+            juce::ModalCallbackFunction::create ([safeThis] (int result)
+            {
+                if (safeThis != nullptr && result == 1)
+                    safeThis->proc.setMode (RackMode::rack);
+            }));
+
+        refresh();   // snap the toggle back until the user confirms
+        return;
+    }
+
+    proc.setMode (newMode);
 }
 
 void UltrapatcherEditor::chooseAndLoadPluginFile()

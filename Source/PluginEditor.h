@@ -2,13 +2,14 @@
 
 #include "PluginProcessor.h"
 #include "PatchCanvas.h"
+#include "RackView.h"
 #include "SurfacePanel.h"
 
 class HostedPluginWindow;
 class SettingsWindow;
 
-// Patcher mode UI: toolbar, searchable plugin list on the left, the patch
-// canvas in the middle, the Surface along the bottom.
+// Toolbar, searchable plugin list on the left, the patch canvas (Patcher mode)
+// or the rack view (Rack mode) in the middle, the Surface along the bottom.
 class UltrapatcherEditor : public juce::AudioProcessorEditor,
                            public juce::FileDragAndDropTarget,
                            private juce::ChangeListener,
@@ -49,7 +50,10 @@ private:
     void updateButtons();
     juce::String getSelectedIdentifier() const;
     void addSelectedPlugin();
-    void removeSelectedNode();
+    void removeSelection();
+    void toggleBypassOnSelection();
+    void requestMode (RackMode);
+    std::vector<NodeUid> selectedPlugins() const;
     void showContextMenu();
     void openSettings();
     void openNodeWindow (NodeUid);
@@ -57,6 +61,8 @@ private:
     UltrapatcherProcessor& proc;
 
     // Toolbar
+    juce::TextButton patcherButton  { "Patcher" };
+    juce::TextButton rackButton     { "Rack" };
     juce::TextButton scanButton     { "Scan" };
     juce::TextButton addButton      { "Add" };
     juce::TextButton removeButton   { "Remove" };
@@ -71,6 +77,7 @@ private:
     juce::Label      statusLabel;
 
     PatchCanvas  canvas;
+    RackView     rackView;
     SurfacePanel surface;
 
     juce::Array<juce::PluginDescription> allTypes, shownTypes;

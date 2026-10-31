@@ -22,7 +22,9 @@ target_sources(Ultrapatcher PRIVATE
     Source/PluginProcessor.cpp
     Source/PatchEngine.cpp
     Source/Mapping.cpp
+    Source/RackEngine.cpp
     Source/PatchCanvas.cpp
+    Source/RackView.cpp
     Source/SurfacePanel.cpp
     Source/PluginEditor.cpp)
 

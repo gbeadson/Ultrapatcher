@@ -2,6 +2,7 @@
 
 #include <juce_audio_utils/juce_audio_utils.h>
 #include "Settings.h"
+#include "ChainStrip.h"
 
 class PoolParameter;
 
@@ -43,9 +44,23 @@ struct MapTarget
     float rangeMin = 0.0f, rangeMax = 1.0f;
 };
 
+// What the rack view needs to draw one chain.
+struct ChainInfo
+{
+    int id = 0;
+    juce::String name;
+    NodeUid stripUid = 0;
+    std::vector<NodeUid> devices;   // in signal order
+};
+
 // Patcher mode: any number of hosted plugins wired with cords. Eight Surface
 // knobs (out of a pool of 128 DAW parameters) can each drive many hosted
 // parameters, each with its own range. Learn mode maps by touch.
+// Rack mode: the same plugins arranged as parallel chains of serial devices,
+// each chain ending in a mixer strip (volume, pan, mute, solo). The rack
+// generates the cords itself. Converting to Patcher mode keeps the graph.
+enum class RackMode { patcher, rack };
+
 class UltrapatcherProcessor : public juce::AudioProcessor,
                               public juce::ChangeBroadcaster,
                               private juce::Timer
@@ -105,6 +120,21 @@ public:
     juce::String getLastError() const { return lastError; }
 
     //==========================================================================
+    // Modes and racks (message thread).
+    RackMode getMode() const { return mode; }
+    void setMode (RackMode);      // Patcher to Rack clears the patch; Rack to Patcher keeps it
+
+    std::vector<ChainInfo> getChains() const;
+    int addChain();                                   // returns the new chain's id
+    void removeChain (int chainId);
+    void renameChain (int chainId, const juce::String&);
+    void moveDevice (NodeUid, int chainId, int index);  // index counts devices left in the chain
+    void setActiveChain (int chainId) { activeChainId = chainId; }
+    int getActiveChain() const { return activeChainId; }
+    ChainStripProcessor* getChainStrip (int chainId) const;
+    void updateSoloSuppression();                     // also runs on the 30 Hz timer
+
+    //==========================================================================
     // Knob mappings.
     juce::RangedAudioParameter* getPoolParameter (int slot) const;
     std::vector<MapTarget> getSlotTargets (int slot) const;
@@ -148,11 +178,21 @@ private:
         juce::PluginDescription desc;
         juce::String name;
         bool bypassed = false;
+        bool isStrip = false;   // a rack chain's mixer, not a hosted plugin
         juce::Point<float> pos;
     };
 
+    struct ChainRecord
+    {
+        int id = 0;
+        juce::String name;
+        NodeUid stripUid = 0;
+        std::vector<NodeUid> devices;
+    };
+
     // A patch as stored in the project, before plugins are loaded.
-    struct SavedNode { NodeUid uid = 0; juce::PluginDescription desc; juce::MemoryBlock state; bool bypassed = false; juce::Point<float> pos; };
+    struct SavedNode { NodeUid uid = 0; juce::PluginDescription desc; juce::MemoryBlock state; bool bypassed = false; bool isStrip = false; juce::Point<float> pos; };
+    struct SavedChain { int id = 0; juce::String name; NodeUid stripUid = 0; std::vector<NodeUid> devices; };
     struct SavedKnob { int slot = 0; juce::String name; std::vector<MapTarget> targets; };
     struct SavedPatch
     {
@@ -162,6 +202,9 @@ private:
         juce::Point<float> inputPos { 24.0f, 40.0f }, outputPos { -1.0f, 40.0f };   // x < 0: right-aligned
         NodeUid nextUid = kFirstPluginUid;
         bool migrated = false;  // saved by an older version: wire automatically
+        RackMode mode = RackMode::patcher;
+        std::vector<SavedChain> chains;
+        int nextChainId = 1;
     };
     struct RestoreJob;
 
@@ -202,6 +245,15 @@ private:
     void endStructureChange();
     void setError (const juce::String&);
     void createDefaultCords();
+    void removeNodeCore (NodeUid);
+
+    // rack (RackEngine.cpp)
+    ChainRecord* findChain (int chainId);
+    ChainRecord* chainOfDevice (NodeUid);
+    NodeUid installStrip (NodeUid fixedUid = 0, const juce::MemoryBlock& state = {});
+    void installIntoChain (std::unique_ptr<juce::AudioProcessor>, const juce::PluginDescription&, int chainId);
+    void rebuildRackWiring();
+    void layoutRackAsPatch();
 
     // mapping (mapping.cpp)
     void rebuildSlot (int slot);
@@ -225,6 +277,11 @@ private:
     std::vector<Cord> cords;
     juce::Point<float> inputPos { 24.0f, 40.0f }, outputPos { -1.0f, 40.0f };   // x < 0: right-aligned
     NodeUid nextUid = kFirstPluginUid;
+
+    RackMode mode = RackMode::patcher;
+    std::vector<ChainRecord> chains;
+    int nextChainId = 1;
+    int activeChainId = 0;
 
     std::array<PoolParameter*, kPoolSize> pool {};
     std::array<KnobMeta, kPoolSize> knobs;

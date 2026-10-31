@@ -18,8 +18,11 @@ void PatchCanvas::refresh()
     infos = proc.getPatchNodes();
     cords = proc.getCords();
 
-    if (selectedNode != 0 && infoFor (selectedNode) == nullptr)
-        selectedNode = 0;
+    for (auto it = selected.begin(); it != selected.end();)
+        it = infoFor (*it) == nullptr ? selected.erase (it) : std::next (it);
+
+    if (primary != 0 && selected.count (primary) == 0)
+        primary = selected.empty() ? 0 : *selected.begin();
 
     if (selectedCord >= (int) cords.size())
         selectedCord = -1;
@@ -154,14 +157,83 @@ bool PatchCanvas::nodeIsConnected (NodeUid uid) const
     return false;
 }
 
-void PatchCanvas::select (NodeUid node, int cordIndex)
+void PatchCanvas::selectionChanged()
 {
-    selectedNode = node;
-    selectedCord = cordIndex;
     repaint();
 
     if (onSelectionChanged)
         onSelectionChanged();
+}
+
+void PatchCanvas::select (NodeUid node, int cordIndex)
+{
+    selected.clear();
+
+    if (node != 0)
+        selected.insert (node);
+
+    primary = node;
+    selectedCord = cordIndex;
+    selectionChanged();
+}
+
+std::vector<NodeUid> PatchCanvas::getSelectedNodes() const
+{
+    return { selected.begin(), selected.end() };
+}
+
+void PatchCanvas::selectAll()
+{
+    selected.clear();
+
+    for (const auto& i : infos)
+        selected.insert (i.uid);
+
+    primary = selected.empty() ? 0 : *selected.begin();
+    selectedCord = -1;
+    selectionChanged();
+}
+
+void PatchCanvas::clearSelection()
+{
+    select (0, -1);
+}
+
+// Selects every node the rectangle touches. Additive keeps the selection that
+// is already there.
+void PatchCanvas::selectInRect (juce::Rectangle<float> area, bool additive)
+{
+    if (! additive)
+        selected.clear();
+
+    for (const auto& i : infos)
+        if (area.intersects (boundsOf (i)))
+            selected.insert (i.uid);
+
+    primary = selected.empty() ? 0 : *selected.rbegin();
+    selectedCord = -1;
+    selectionChanged();
+}
+
+void PatchCanvas::deleteSelection()
+{
+    std::vector<NodeUid> doomed;
+
+    for (auto uid : selected)
+        if (uid != kInputUid && uid != kOutputUid)
+            doomed.push_back (uid);
+
+    selected.clear();
+    primary = 0;
+    selectionChanged();
+
+    for (auto uid : doomed)
+        proc.removeNode (uid);
+}
+
+juce::Rectangle<float> PatchCanvas::marqueeRect() const
+{
+    return juce::Rectangle<float> (marqueeStart, marqueeEnd);
 }
 
 //==============================================================================
@@ -185,14 +257,14 @@ void PatchCanvas::paint (juce::Graphics& g)
             continue;
 
         const auto path = cordPath (portPos (*s, cord.midi, true), portPos (*d, cord.midi, false));
-        const bool selected = c == selectedCord, hinted = c == insertHint;
+        const bool cordSelected = c == selectedCord, hinted = c == insertHint;
         auto colour = cord.midi ? kMidiColour : kAudioColour;
 
         if (hinted)
             colour = juce::Colours::white;
 
-        g.setColour (colour.withAlpha (selected || hinted ? 1.0f : 0.8f));
-        g.strokePath (path, juce::PathStrokeType ((cord.midi ? 1.8f : 2.6f) + (selected || hinted ? 1.6f : 0.0f)));
+        g.setColour (colour.withAlpha (cordSelected || hinted ? 1.0f : 0.8f));
+        g.strokePath (path, juce::PathStrokeType ((cord.midi ? 1.8f : 2.6f) + (cordSelected || hinted ? 1.6f : 0.0f)));
     }
 
     // cord being dragged
@@ -210,13 +282,13 @@ void PatchCanvas::paint (juce::Graphics& g)
     for (const auto& i : infos)
     {
         const auto b = boundsOf (i);
-        const bool selected = i.uid == selectedNode;
+        const bool isSelected = selected.count (i.uid) > 0;
         const float alpha = i.bypassed ? 0.55f : 1.0f;
 
         g.setColour (juce::Colour (i.isIO ? 0xff23303f : 0xff2b2f36).withAlpha (alpha));
         g.fillRoundedRectangle (b, 7.0f);
-        g.setColour ((selected ? juce::Colours::white : juce::Colour (0xff4a5059)).withAlpha (selected ? 0.95f : alpha));
-        g.drawRoundedRectangle (b, 7.0f, selected ? 2.0f : 1.0f);
+        g.setColour ((isSelected ? juce::Colours::white : juce::Colour (0xff4a5059)).withAlpha (isSelected ? 0.95f : alpha));
+        g.drawRoundedRectangle (b, 7.0f, isSelected ? 2.0f : 1.0f);
 
         auto text = b.reduced (12.0f, 8.0f);
         g.setColour (juce::Colours::white.withAlpha (alpha));
@@ -265,6 +337,15 @@ void PatchCanvas::paint (juce::Graphics& g)
             }
     }
 
+    if (dragMode == DragMode::marquee)
+    {
+        const auto r = marqueeRect();
+        g.setColour (juce::Colours::dodgerblue.withAlpha (0.14f));
+        g.fillRect (r);
+        g.setColour (juce::Colours::dodgerblue.withAlpha (0.9f));
+        g.drawRect (r, 1.0f);
+    }
+
     if (infos.size() <= 2)
     {
         g.setColour (juce::Colours::grey);
@@ -278,14 +359,20 @@ void PatchCanvas::paint (juce::Graphics& g)
 //==============================================================================
 void PatchCanvas::mouseDown (const juce::MouseEvent& e)
 {
-    grabKeyboardFocus();
+    if (isShowing())
+        grabKeyboardFocus();
     const auto p = e.position;
+    const bool additive = e.mods.isShiftDown() || e.mods.isCommandDown() || e.mods.isCtrlDown();
 
     if (e.mods.isPopupMenu())
     {
         if (auto node = hitNode (p))
         {
-            select (node, -1);
+            if (selected.count (node) == 0)
+                select (node, -1);
+            else
+                primary = node;
+
             showNodeMenu (node);
         }
         else if (auto cord = hitCord (p, 8.0f); cord >= 0)
@@ -301,6 +388,9 @@ void PatchCanvas::mouseDown (const juce::MouseEvent& e)
         return;
     }
 
+    dragMoved = false;
+    dragAdditive = additive;
+
     if (auto port = hitPort (p); port.valid && port.output)
     {
         dragMode = DragMode::cord;
@@ -312,11 +402,46 @@ void PatchCanvas::mouseDown (const juce::MouseEvent& e)
 
     if (auto node = hitNode (p))
     {
-        select (node, -1);
+        dragWasSelected = selected.count (node) > 0;
+
+        if (additive)
+        {
+            if (dragWasSelected)
+            {
+                selected.erase (node);
+                primary = selected.empty() ? 0 : *selected.rbegin();
+                selectedCord = -1;
+                selectionChanged();
+                return;   // toggled off: nothing to drag
+            }
+
+            selected.insert (node);
+            primary = node;
+            selectedCord = -1;
+            selectionChanged();
+        }
+        else if (! dragWasSelected)
+        {
+            select (node, -1);
+        }
+        else
+        {
+            primary = node;
+            selectedCord = -1;
+            repaint();
+        }
+
         dragMode = DragMode::node;
         dragUid = node;
-        dragOffset = p - boundsOf (*infoFor (node)).getPosition();
-        dragStartedUnconnected = ! nodeIsConnected (node) && node != kInputUid && node != kOutputUid;
+        dragMouseStart = p;
+        dragStart.clear();
+
+        for (auto uid : selected)
+            if (const auto* info = infoFor (uid))
+                dragStart[uid] = boundsOf (*info).getPosition();
+
+        dragStartedUnconnected = selected.size() == 1 && ! nodeIsConnected (node)
+                                   && node != kInputUid && node != kOutputUid;
         return;
     }
 
@@ -326,7 +451,13 @@ void PatchCanvas::mouseDown (const juce::MouseEvent& e)
         return;
     }
 
-    select (0, -1);
+    // Empty space: start a selection rectangle.
+    marqueeBase = additive ? selected : std::set<NodeUid>();
+    dragMode = DragMode::marquee;
+    marqueeStart = marqueeEnd = p;
+
+    if (! additive)
+        select (0, -1);
 }
 
 void PatchCanvas::mouseDrag (const juce::MouseEvent& e)
@@ -338,14 +469,45 @@ void PatchCanvas::mouseDrag (const juce::MouseEvent& e)
         cordEnd = p;
         repaint();
     }
+    else if (dragMode == DragMode::marquee)
+    {
+        marqueeEnd = p;
+        selected = marqueeBase;
+
+        for (const auto& i : infos)
+            if (marqueeRect().intersects (boundsOf (i)))
+                selected.insert (i.uid);
+
+        primary = selected.empty() ? 0 : *selected.rbegin();
+        selectedCord = -1;
+        selectionChanged();
+    }
     else if (dragMode == DragMode::node)
     {
-        const auto target = (p - dragOffset);
-        proc.setNodePosition (dragUid, { juce::jlimit (0.0f, juce::jmax (0.0f, (float) getWidth() - kNodeW), target.x),
-                                         juce::jlimit (0.0f, juce::jmax (0.0f, (float) getHeight() - kNodeH), target.y) });
+        if (! dragMoved && p.getDistanceFrom (dragMouseStart) < 3.0f)
+            return;
+
+        dragMoved = true;
+        auto delta = p - dragMouseStart;
+
+        // Keep the whole group inside the canvas.
+        float minX = 1.0e9f, minY = 1.0e9f, maxX = -1.0e9f, maxY = -1.0e9f;
+
+        for (const auto& [uid, start] : dragStart)
+        {
+            minX = juce::jmin (minX, start.x);  maxX = juce::jmax (maxX, start.x);
+            minY = juce::jmin (minY, start.y);  maxY = juce::jmax (maxY, start.y);
+        }
+
+        delta.x = juce::jlimit (-minX, juce::jmax (-minX, (float) getWidth()  - kNodeW - maxX), delta.x);
+        delta.y = juce::jlimit (-minY, juce::jmax (-minY, (float) getHeight() - kNodeH - maxY), delta.y);
+
+        for (const auto& [uid, start] : dragStart)
+            proc.setNodePosition (uid, start + delta);
+
         infos = proc.getPatchNodes();
 
-        // Dragging an unconnected node over a cord previews the splice.
+        // Dragging a lone unconnected node over a cord previews the splice.
         insertHint = -1;
 
         if (dragStartedUnconnected)
@@ -382,15 +544,27 @@ void PatchCanvas::mouseUp (const juce::MouseEvent& e)
         return;
     }
 
+    if (dragMode == DragMode::marquee)
+    {
+        dragMode = DragMode::none;
+        repaint();
+        return;
+    }
+
     if (dragMode == DragMode::node)
     {
         const auto uid = dragUid;
-        const bool splice = dragStartedUnconnected && insertHint >= 0 && insertHint < (int) cords.size();
+        const bool splice = dragMoved && dragStartedUnconnected && insertHint >= 0 && insertHint < (int) cords.size();
         const Cord target = splice ? cords[(size_t) insertHint] : Cord();
+        const bool collapse = ! dragMoved && ! dragAdditive && dragWasSelected && selected.size() > 1;
 
         dragMode = DragMode::none;
         dragUid = 0;
         insertHint = -1;
+        dragStart.clear();
+
+        if (collapse)
+            select (uid, -1);   // a plain click inside a group selects just that node
 
         if (splice)
             proc.insertNodeOnCord (uid, target);
@@ -417,56 +591,79 @@ bool PatchCanvas::keyPressed (const juce::KeyPress& key)
             return true;
         }
 
-        if (selectedNode != 0 && selectedNode != kInputUid && selectedNode != kOutputUid)
+        if (! selected.empty())
         {
-            const auto node = selectedNode;
-            selectedNode = 0;
-            proc.removeNode (node);
-
-            if (onSelectionChanged)
-                onSelectionChanged();
-
+            deleteSelection();
             return true;
         }
+    }
+
+    if (key == juce::KeyPress ('a', juce::ModifierKeys::commandModifier, 0)
+        || key == juce::KeyPress ('a', juce::ModifierKeys::ctrlModifier, 0))
+    {
+        selectAll();
+        return true;
+    }
+
+    if (key == juce::KeyPress::escapeKey)
+    {
+        clearSelection();
+        return true;
     }
 
     return false;
 }
 
 //==============================================================================
-void PatchCanvas::showNodeMenu (NodeUid uid)
+void PatchCanvas::showNodeMenu (NodeUid)
 {
-    const auto* info = infoFor (uid);
+    std::vector<NodeUid> targets;
 
-    if (info == nullptr)
-        return;
+    for (auto n : selected)
+        if (n != kInputUid && n != kOutputUid)
+            targets.push_back (n);
 
     juce::PopupMenu menu;
 
-    if (! info->isIO)
-    {
-        menu.addItem (1, "Open plugin window");
-        menu.addItem (2, "Bypass", true, info->bypassed);
-        menu.addSeparator();
-        menu.addItem (3, "Remove");
-    }
-    else
+    if (targets.empty())
     {
         menu.addItem (4, "Input and Output stay in the patch", false);
     }
-
-    juce::Component::SafePointer<PatchCanvas> safeThis (this);
-    const bool bypassed = info->bypassed;
-
-    menu.showMenuAsync (juce::PopupMenu::Options(), [safeThis, uid, bypassed] (int result)
+    else
     {
-        if (safeThis == nullptr)
-            return;
+        bool allBypassed = true;
 
-        if (result == 1 && safeThis->onOpenNode)  safeThis->onOpenNode (uid);
-        else if (result == 2)                      safeThis->proc.setNodeBypassed (uid, ! bypassed);
-        else if (result == 3)                      safeThis->proc.removeNode (uid);
-    });
+        for (auto n : targets)
+            if (const auto* info = infoFor (n))
+                allBypassed = allBypassed && info->bypassed;
+
+        const auto count = juce::String (targets.size());
+        menu.addItem (1, targets.size() == 1 ? "Open plugin window" : "Open " + count + " plugin windows");
+        menu.addItem (2, "Bypass", true, allBypassed);
+        menu.addSeparator();
+        menu.addItem (3, targets.size() == 1 ? "Remove" : "Remove " + count + " nodes");
+
+        juce::Component::SafePointer<PatchCanvas> safeThis (this);
+
+        menu.showMenuAsync (juce::PopupMenu::Options(), [safeThis, targets, allBypassed] (int result)
+        {
+            if (safeThis == nullptr)
+                return;
+
+            if (result == 1 && safeThis->onOpenNode)
+                for (auto n : targets)
+                    safeThis->onOpenNode (n);
+            else if (result == 2)
+                for (auto n : targets)
+                    safeThis->proc.setNodeBypassed (n, ! allBypassed);
+            else if (result == 3)
+                safeThis->deleteSelection();
+        });
+
+        return;
+    }
+
+    menu.showMenuAsync (juce::PopupMenu::Options(), nullptr);
 }
 
 void PatchCanvas::showCordMenu (int cordIndex)
